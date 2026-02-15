@@ -1,0 +1,8 @@
+/target
+.DS_Store
+.cargo/registry/
+.cargo/git/
+.cargo/bin/
+
+!.cargo/config.toml
+!.cargo/config

@@ -1,0 +1,10 @@
+[package]
+name = "streamcrab-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamcrab-core = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+bincode = { workspace = true }

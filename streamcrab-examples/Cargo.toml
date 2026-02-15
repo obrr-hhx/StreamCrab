@@ -1,0 +1,10 @@
+[package]
+name = "streamcrab-examples"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamcrab-api = { workspace = true }
+streamcrab-core = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
