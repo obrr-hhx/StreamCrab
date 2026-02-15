@@ -2,6 +2,7 @@
 name = "streamcrab-api"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 streamcrab-core = { workspace = true }
