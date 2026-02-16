@@ -1,70 +1,104 @@
-use std::collections::HashMap;
+//! # State Management
+//!
+//! Keyed state backends for stateful stream processing.
+//!
+//! ## State Types
+//!
+//! - [`ValueState`] — Single value per key
+//! - [`ListState`] — List of values per key
+//! - [`MapState`] — Map of key-value pairs per key
+//!
+//! ## Backends
+//!
+//! - [`HashMapStateBackend`] — In-memory HashMap (Local mode, extreme performance)
+//! - Future: RocksDBStateBackend (for larger-than-memory state)
 
-/// Local in-memory state backend using HashMap.
-/// Keys are (serialized_key, state_name) pairs, values are serialized bytes.
+use crate::types::StreamData;
+use anyhow::Result;
+
+pub mod hashmap;
+
+pub use hashmap::HashMapStateBackend;
+
+/// Value state: stores a single value per key.
+pub trait ValueState<V>: Send
+where
+    V: StreamData,
+{
+    /// Get the current value.
+    fn get(&self) -> Result<Option<V>>;
+
+    /// Update the value.
+    fn put(&mut self, value: V) -> Result<()>;
+
+    /// Clear the value.
+    fn clear(&mut self) -> Result<()>;
+}
+
+/// List state: stores a list of values per key.
+pub trait ListState<V>: Send
+where
+    V: StreamData,
+{
+    /// Get all values in the list.
+    fn get(&self) -> Result<Vec<V>>;
+
+    /// Add a value to the list.
+    fn add(&mut self, value: V) -> Result<()>;
+
+    /// Clear the list.
+    fn clear(&mut self) -> Result<()>;
+}
+
+/// Map state: stores a map of key-value pairs per key.
+pub trait MapState<K, V>: Send
+where
+    K: StreamData + std::hash::Hash + Eq,
+    V: StreamData,
+{
+    /// Get a value by map key.
+    fn get(&self, key: &K) -> Result<Option<V>>;
+
+    /// Put a key-value pair.
+    fn put(&mut self, key: K, value: V) -> Result<()>;
+
+    /// Remove a key.
+    fn remove(&mut self, key: &K) -> Result<Option<V>>;
+
+    /// Clear the entire map.
+    fn clear(&mut self) -> Result<()>;
+}
+
+/// Keyed state backend: manages state for the current processing key.
 ///
-/// This is the "Local mode" backend — zero network overhead, no dynamic rescale support.
-#[derive(Debug, Default)]
-pub struct LocalStateBackend {
-    states: HashMap<(Vec<u8>, String), Vec<u8>>,
+/// The backend maintains a "current key" context. All state operations
+/// are scoped to this key.
+pub trait KeyedStateBackend: Send {
+    /// Set the current processing key.
+    ///
+    /// All subsequent state operations will be scoped to this key.
+    fn set_current_key(&mut self, key: Vec<u8>);
+
+    /// Get a value state handle.
+    fn get_value_state<V>(&mut self, name: &str) -> Box<dyn ValueState<V> + '_>
+    where
+        V: StreamData;
+
+    /// Get a list state handle.
+    fn get_list_state<V>(&mut self, name: &str) -> Box<dyn ListState<V> + '_>
+    where
+        V: StreamData;
+
+    /// Get a map state handle.
+    fn get_map_state<K, V>(&mut self, name: &str) -> Box<dyn MapState<K, V> + '_>
+    where
+        K: StreamData + std::hash::Hash + Eq,
+        V: StreamData;
+
+    /// Snapshot all state for checkpointing.
+    fn snapshot(&self) -> Result<Vec<u8>>;
+
+    /// Restore state from a checkpoint.
+    fn restore(&mut self, data: &[u8]) -> Result<()>;
 }
 
-impl LocalStateBackend {
-    /// Create an empty local state backend.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Store a value for the given key and state name.
-    pub fn put(&mut self, key: &[u8], state_name: &str, value: Vec<u8>) {
-        self.states
-            .insert((key.to_vec(), state_name.to_string()), value);
-    }
-
-    /// Retrieve a value for the given key and state name.
-    pub fn get(&self, key: &[u8], state_name: &str) -> Option<&Vec<u8>> {
-        self.states.get(&(key.to_vec(), state_name.to_string()))
-    }
-
-    /// Remove a value for the given key and state name.
-    pub fn remove(&mut self, key: &[u8], state_name: &str) -> Option<Vec<u8>> {
-        self.states.remove(&(key.to_vec(), state_name.to_string()))
-    }
-
-    /// Clear all state.
-    pub fn clear(&mut self) {
-        self.states.clear();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_put_get() {
-        let mut backend = LocalStateBackend::new();
-        backend.put(b"key1", "count", vec![1, 0, 0, 0]);
-        assert_eq!(backend.get(b"key1", "count"), Some(&vec![1, 0, 0, 0]));
-        assert_eq!(backend.get(b"key1", "other"), None);
-        assert_eq!(backend.get(b"key2", "count"), None);
-    }
-
-    #[test]
-    fn test_remove() {
-        let mut backend = LocalStateBackend::new();
-        backend.put(b"k", "s", vec![42]);
-        assert_eq!(backend.remove(b"k", "s"), Some(vec![42]));
-        assert_eq!(backend.get(b"k", "s"), None);
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut backend = LocalStateBackend::new();
-        backend.put(b"a", "s", vec![1]);
-        backend.put(b"b", "s", vec![2]);
-        backend.clear();
-        assert_eq!(backend.get(b"a", "s"), None);
-        assert_eq!(backend.get(b"b", "s"), None);
-    }
-}
