@@ -16,9 +16,14 @@
 //! - [`runtime`] — Execution utilities: topological sort, downstream routing.
 //! - [`state`] — State backends: [`LocalStateBackend`](state::LocalStateBackend).
 
+pub mod channel;
 pub mod graph;
+pub mod input_gate;
 pub mod job_graph;
+pub mod operator_chain;
+pub mod output_gate;
 pub mod partitioner;
 pub mod runtime;
 pub mod state;
+pub mod task;
 pub mod types;
