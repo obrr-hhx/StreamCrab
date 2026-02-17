@@ -14,7 +14,8 @@
 //! - [`partitioner`] — Data partitioning: [`HashPartitioner`](partitioner::HashPartitioner),
 //!   [`RoundRobinPartitioner`](partitioner::RoundRobinPartitioner).
 //! - [`runtime`] — Execution utilities: topological sort, downstream routing.
-//! - [`state`] — State backends: [`LocalStateBackend`](state::LocalStateBackend).
+//! - [`state`] — State backends: [`HashMapStateBackend`](state::HashMapStateBackend).
+//! - [`process`] — Keyed process functions: [`KeyedProcessFunction`](process::KeyedProcessFunction).
 
 pub mod channel;
 pub mod graph;
@@ -23,6 +24,7 @@ pub mod job_graph;
 pub mod operator_chain;
 pub mod output_gate;
 pub mod partitioner;
+pub mod process;
 pub mod runtime;
 pub mod state;
 pub mod task;

@@ -1,209 +1,34 @@
-use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
-use streamcrab_core::graph::{OperatorType, Partition};
-use streamcrab_core::types::{BoxedValue, NodeId, StreamData};
+use streamcrab_core::types::StreamData;
 
-use crate::environment::EnvInner;
-
-/// Factory stored during graph construction, later used by the runtime.
-#[allow(clippy::type_complexity)]
-pub enum OperatorFactory {
-    Source {
-        node_id: NodeId,
-        produce: Box<dyn Fn() -> Vec<BoxedValue>>,
-    },
-    Map {
-        node_id: NodeId,
-        apply: Box<dyn Fn(BoxedValue) -> BoxedValue>,
-    },
-    Filter {
-        node_id: NodeId,
-        predicate: Box<dyn Fn(&BoxedValue) -> bool>,
-    },
-    FlatMap {
-        node_id: NodeId,
-        apply: Box<dyn Fn(BoxedValue) -> Vec<BoxedValue>>,
-    },
-    KeyBy {
-        node_id: NodeId,
-        key_fn: Box<dyn Fn(&BoxedValue) -> Vec<u8>>,
-    },
-    Reduce {
-        node_id: NodeId,
-        reduce_fn: Box<dyn Fn(BoxedValue, BoxedValue) -> BoxedValue>,
-    },
-    Sink {
-        node_id: NodeId,
-        sink_fn: Box<dyn Fn(&BoxedValue)>,
-    },
-}
-
-impl OperatorFactory {
-    /// Return the graph node ID associated with this operator.
-    pub fn node_id(&self) -> NodeId {
-        match self {
-            Self::Source { node_id, .. }
-            | Self::Map { node_id, .. }
-            | Self::Filter { node_id, .. }
-            | Self::FlatMap { node_id, .. }
-            | Self::KeyBy { node_id, .. }
-            | Self::Reduce { node_id, .. }
-            | Self::Sink { node_id, .. } => *node_id,
-        }
-    }
-}
-
-/// A handle representing a stream of type `T` in the processing graph.
+/// A stream of elements of type `T`.
 ///
-/// Provides a fluent builder API for chaining transformations:
-/// [`map`](Self::map), [`filter`](Self::filter), [`flat_map`](Self::flat_map),
-/// [`key_by`](Self::key_by), [`print`](Self::print), and [`collect`](Self::collect).
-pub struct DataStream<T: StreamData> {
-    pub(crate) env: Rc<RefCell<EnvInner>>,
-    pub(crate) node_id: NodeId,
-    pub(crate) _phantom: PhantomData<T>,
+/// Created by [`StreamExecutionEnvironment::from_iter`].
+/// Call [`key_by`](Self::key_by) to partition by key.
+pub struct DataStream<T>
+where
+    T: StreamData + Send + 'static,
+{
+    pub(crate) source_data: Vec<T>,
 }
 
-impl<T: StreamData + std::fmt::Debug> DataStream<T> {
-    /// Apply a one-to-one transformation to each element.
-    pub fn map<O, F>(self, f: F) -> DataStream<O>
+impl<T> DataStream<T>
+where
+    T: StreamData + Send + std::fmt::Debug + 'static,
+{
+    /// Partition the stream by key, returning a [`KeyedStream`].
+    pub fn key_by<K, F>(self, key_fn: F) -> KeyedStream<K, T, F>
     where
-        O: StreamData + std::fmt::Debug,
-        F: Fn(T) -> O + 'static,
+        K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
+        F: Fn(&T) -> K + Send + Sync + Clone + 'static,
     {
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::Map, 1);
-        inner
-            .graph
-            .add_edge(self.node_id, new_id, Partition::Forward);
-        inner.operators.push(OperatorFactory::Map {
-            node_id: new_id,
-            apply: Box::new(move |val| {
-                let input: T = val.downcast();
-                BoxedValue::new(f(input))
-            }),
-        });
-        drop(inner);
-        DataStream {
-            env: self.env,
-            node_id: new_id,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Keep only elements for which the predicate returns `true`.
-    pub fn filter<F>(self, f: F) -> DataStream<T>
-    where
-        F: Fn(&T) -> bool + 'static,
-    {
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::Filter, 1);
-        inner
-            .graph
-            .add_edge(self.node_id, new_id, Partition::Forward);
-        inner.operators.push(OperatorFactory::Filter {
-            node_id: new_id,
-            predicate: Box::new(move |val| {
-                let input = val.downcast_ref::<T>().expect("type mismatch in filter");
-                f(input)
-            }),
-        });
-        drop(inner);
-        DataStream {
-            env: self.env,
-            node_id: new_id,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Apply a one-to-many transformation, producing zero or more output elements per input.
-    pub fn flat_map<O, F>(self, f: F) -> DataStream<O>
-    where
-        O: StreamData + std::fmt::Debug,
-        F: Fn(T) -> Vec<O> + 'static,
-    {
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::FlatMap, 1);
-        inner
-            .graph
-            .add_edge(self.node_id, new_id, Partition::Forward);
-        inner.operators.push(OperatorFactory::FlatMap {
-            node_id: new_id,
-            apply: Box::new(move |val| {
-                let input: T = val.downcast();
-                f(input).into_iter().map(BoxedValue::new).collect()
-            }),
-        });
-        drop(inner);
-        DataStream {
-            env: self.env,
-            node_id: new_id,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Partition the stream by key, returning a [`KeyedStream`] that supports stateful operations.
-    pub fn key_by<K, F>(self, f: F) -> KeyedStream<T>
-    where
-        K: StreamData,
-        F: Fn(&T) -> K + 'static,
-    {
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::KeyBy, 1);
-        inner.graph.add_edge(self.node_id, new_id, Partition::Hash);
-        inner.operators.push(OperatorFactory::KeyBy {
-            node_id: new_id,
-            key_fn: Box::new(move |val| {
-                let input = val.downcast_ref::<T>().expect("type mismatch in key_by");
-                let key = f(input);
-                bincode::serialize(&key).expect("key serialization failed")
-            }),
-        });
-        drop(inner);
         KeyedStream {
-            env: self.env,
-            node_id: new_id,
+            source_data: self.source_data,
+            key_fn,
             _phantom: PhantomData,
         }
-    }
-
-    /// Print each element to stdout using its `Debug` representation. Terminal sink.
-    pub fn print(self) {
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::Sink, 1);
-        inner
-            .graph
-            .add_edge(self.node_id, new_id, Partition::Forward);
-        inner.operators.push(OperatorFactory::Sink {
-            node_id: new_id,
-            sink_fn: Box::new(|val| {
-                let input = val.downcast_ref::<T>().expect("type mismatch in print");
-                println!("{input:?}");
-            }),
-        });
-    }
-
-    /// Collect all output into a shared Vec for testing/inspection.
-    pub fn collect(self) -> Rc<RefCell<Vec<T>>> {
-        let results: Rc<RefCell<Vec<T>>> = Rc::new(RefCell::new(Vec::new()));
-        let results_clone = Rc::clone(&results);
-
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::Sink, 1);
-        inner
-            .graph
-            .add_edge(self.node_id, new_id, Partition::Forward);
-        inner.operators.push(OperatorFactory::Sink {
-            node_id: new_id,
-            sink_fn: Box::new(move |val| {
-                let input = val.downcast_ref::<T>().expect("type mismatch in collect");
-                results_clone.borrow_mut().push(input.clone());
-            }),
-        });
-
-        results
     }
 }
 
@@ -211,37 +36,258 @@ impl<T: StreamData + std::fmt::Debug> DataStream<T> {
 ///
 /// Created by calling [`DataStream::key_by`]. Elements with the same key are
 /// grouped together for aggregation.
-pub struct KeyedStream<T: StreamData> {
-    pub(crate) env: Rc<RefCell<EnvInner>>,
-    pub(crate) node_id: NodeId,
-    pub(crate) _phantom: PhantomData<T>,
+pub struct KeyedStream<K, T, KeyFn>
+where
+    K: StreamData + Send + 'static,
+    T: StreamData + Send + 'static,
+    KeyFn: Fn(&T) -> K + Send + 'static,
+{
+    pub(crate) source_data: Vec<T>,
+    pub(crate) key_fn: KeyFn,
+    pub(crate) _phantom: PhantomData<K>,
 }
 
-impl<T: StreamData + std::fmt::Debug> KeyedStream<T> {
-    /// Reduce elements with the same key by repeatedly applying `f` to the
-    /// accumulated value and each new element. Emits an updated result on every input.
-    pub fn reduce<F>(self, f: F) -> DataStream<T>
+impl<K, T, KeyFn> KeyedStream<K, T, KeyFn>
+where
+    K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
+    T: StreamData + Send + std::fmt::Debug + 'static,
+    KeyFn: Fn(&T) -> K + Send + Sync + Clone + 'static,
+{
+    /// Reduce elements with the same key by repeatedly applying `reduce_fn` to the
+    /// accumulated value and each new element.
+    ///
+    /// Returns a [`ReduceJob`] that can be executed with [`execute_with_parallelism`](ReduceJob::execute_with_parallelism).
+    pub fn reduce<ReduceFn>(self, reduce_fn: ReduceFn) -> ReduceJob<K, T, KeyFn, ReduceFn>
     where
-        F: Fn(T, T) -> T + 'static,
+        ReduceFn: Fn(T, T) -> T + Send + Sync + Clone + 'static,
     {
-        let mut inner = self.env.borrow_mut();
-        let new_id = inner.graph.add_node(OperatorType::Reduce, 1);
-        inner
-            .graph
-            .add_edge(self.node_id, new_id, Partition::Forward);
-        inner.operators.push(OperatorFactory::Reduce {
-            node_id: new_id,
-            reduce_fn: Box::new(move |a, b| {
-                let va: T = a.downcast();
-                let vb: T = b.downcast();
-                BoxedValue::new(f(va, vb))
-            }),
-        });
-        drop(inner);
-        DataStream {
-            env: self.env,
-            node_id: new_id,
+        ReduceJob {
+            source_data: self.source_data,
+            key_fn: self.key_fn,
+            reduce_fn,
             _phantom: PhantomData,
         }
+    }
+}
+
+/// A job that performs keyed reduce aggregation.
+///
+/// Created by calling [`KeyedStream::reduce`].
+/// Execute with [`execute_with_parallelism`](Self::execute_with_parallelism).
+pub struct ReduceJob<K, T, KeyFn, ReduceFn>
+where
+    K: StreamData + Send + 'static,
+    T: StreamData + Send + 'static,
+    KeyFn: Fn(&T) -> K + Send + 'static,
+    ReduceFn: Fn(T, T) -> T + Send + 'static,
+{
+    pub(crate) source_data: Vec<T>,
+    pub(crate) key_fn: KeyFn,
+    pub(crate) reduce_fn: ReduceFn,
+    pub(crate) _phantom: PhantomData<K>,
+}
+
+impl<K, T, KeyFn, ReduceFn> ReduceJob<K, T, KeyFn, ReduceFn>
+where
+    K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
+    T: StreamData + Send + std::fmt::Debug + Clone + 'static,
+    KeyFn: Fn(&T) -> K + Send + Sync + Clone + 'static,
+    ReduceFn: Fn(T, T) -> T + Send + Sync + Clone + 'static,
+{
+    /// Execute the job with the specified parallelism.
+    ///
+    /// Returns the aggregated results as a HashMap.
+    ///
+    /// # Architecture
+    ///
+    /// Creates a pipeline:
+    /// ```text
+    /// Source Task (1 thread)
+    ///     |
+    ///     | Hash Partition (by key)
+    ///     v
+    /// Reduce Tasks (parallelism threads)
+    ///     |
+    ///     v
+    /// Collector Task (1 thread)
+    /// ```
+    pub fn execute_with_parallelism(
+        self,
+        parallelism: usize,
+    ) -> anyhow::Result<Arc<Mutex<std::collections::HashMap<K, T>>>> {
+        use std::thread;
+        use streamcrab_core::channel::local_channel;
+        use streamcrab_core::operator_chain::Operator;
+        use streamcrab_core::partitioner::{HashPartitioner, Partitioner};
+        use streamcrab_core::process::{ReduceFunction, ReduceOperator};
+        use streamcrab_core::state::HashMapStateBackend;
+        use streamcrab_core::types::StreamElement;
+
+        let buffer_size = 1024;
+        let results = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let results_clone = Arc::clone(&results);
+
+        // Create channels: Source -> Reduce Tasks
+        let mut source_to_reduce_channels = Vec::new();
+        for _ in 0..parallelism {
+            source_to_reduce_channels.push(local_channel(buffer_size));
+        }
+
+        // Create channels: Reduce Tasks -> Collector
+        let mut reduce_to_collector_channels = Vec::new();
+        for _ in 0..parallelism {
+            reduce_to_collector_channels.push(local_channel(buffer_size));
+        }
+
+        // Spawn Source Task
+        let source_senders: Vec<_> = source_to_reduce_channels
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect();
+
+        let source_receivers: Vec<_> = source_to_reduce_channels
+            .into_iter()
+            .map(|(_, receiver)| receiver)
+            .collect();
+
+        let source_data = self.source_data;
+        let key_fn = self.key_fn.clone();
+
+        let source_handle = thread::spawn(move || -> anyhow::Result<()> {
+            let partitioner = HashPartitioner::new(key_fn.clone());
+
+            for item in source_data {
+                // Determine target partition
+                let partition = partitioner.partition(&item, parallelism);
+
+                // Send to target reduce task
+                let element = StreamElement::record(item);
+                source_senders[partition].send(element)?;
+            }
+
+            // Send End markers
+            for sender in &source_senders {
+                sender.send(StreamElement::End)?;
+            }
+
+            Ok(())
+        });
+
+        // Spawn Reduce Tasks
+        let mut reduce_handles = Vec::new();
+
+        let collector_senders: Vec<_> = reduce_to_collector_channels
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect();
+
+        let collector_receivers: Vec<_> = reduce_to_collector_channels
+            .into_iter()
+            .map(|(_, receiver)| receiver)
+            .collect();
+
+        let mut source_receivers_iter = source_receivers.into_iter();
+
+        for task_id in 0..parallelism {
+            let receiver = source_receivers_iter.next().unwrap();
+            let sender = collector_senders[task_id].clone();
+            let reduce_fn = self.reduce_fn.clone();
+            let key_fn = self.key_fn.clone();
+
+            let handle = thread::spawn(move || -> anyhow::Result<()> {
+                // Create reduce operator
+                struct UserReducer<F> {
+                    reduce_fn: F,
+                }
+
+                impl<T, F> ReduceFunction<T> for UserReducer<F>
+                where
+                    T: StreamData,
+                    F: Fn(T, T) -> T + Send,
+                {
+                    fn reduce(&mut self, value1: T, value2: T) -> anyhow::Result<T> {
+                        Ok((self.reduce_fn)(value1, value2))
+                    }
+                }
+
+                let reducer = UserReducer { reduce_fn };
+                let backend = HashMapStateBackend::new();
+                let mut operator = ReduceOperator::new(reducer, backend);
+
+                loop {
+                    // Receive from source
+                    let element = receiver.recv()?;
+
+                    match element {
+                        StreamElement::Record(record) => {
+                            let item = record.value;
+                            let key = key_fn(&item);
+
+                            // Process batch of 1 (simplified for now)
+                            let input = vec![(key, item)];
+                            let mut output = Vec::new();
+                            operator.process_batch(&input, &mut output)?;
+
+                            // Send results to collector
+                            for result in output {
+                                let out_element = StreamElement::record(result);
+                                sender.send(out_element)?;
+                            }
+                        }
+                        StreamElement::End => {
+                            // Forward End marker
+                            sender.send(StreamElement::End)?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(())
+            });
+
+            reduce_handles.push(handle);
+        }
+
+        // Spawn Collector Task
+        let collector_handle = thread::spawn(move || -> anyhow::Result<()> {
+            let mut ended_count = 0;
+            let total_tasks = collector_receivers.len();
+
+            while ended_count < total_tasks {
+                // Round-robin read from all reduce tasks
+                for receiver in &collector_receivers {
+                    match receiver.try_recv() {
+                        Ok(Some(element)) => match element {
+                            StreamElement::Record(record) => {
+                                let (key, value): (K, T) = record.value;
+                                results_clone.lock().unwrap().insert(key, value);
+                            }
+                            StreamElement::End => {
+                                ended_count += 1;
+                            }
+                            _ => {}
+                        },
+                        Ok(None) | Err(_) => {
+                            // No data available, continue
+                        }
+                    }
+                }
+
+                // Small sleep to avoid busy waiting
+                thread::sleep(std::time::Duration::from_micros(100));
+            }
+
+            Ok(())
+        });
+
+        // Wait for all tasks to complete
+        source_handle.join().unwrap()?;
+        for handle in reduce_handles {
+            handle.join().unwrap()?;
+        }
+        collector_handle.join().unwrap()?;
+
+        Ok(results)
     }
 }
