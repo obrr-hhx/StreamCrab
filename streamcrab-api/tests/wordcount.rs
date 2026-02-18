@@ -99,6 +99,57 @@ fn test_wordcount_with_flat_map() {
     assert_eq!(final_counts.len(), 5);
 }
 
+/// Stress test: 100K records, 100 unique keys, parallelism=8.
+///
+/// Generates records in round-robin order to simulate interleaved arrival:
+///   (key=0, 1), (key=1, 1), ..., (key=99, 1), (key=0, 1), ...
+/// Each key appears exactly 1000 times, so the expected sum per key is 1000.
+/// Any data loss would show up as a count < 1000 for some key.
+#[test]
+fn test_stress_100k_parallelism_8() {
+    let env = StreamExecutionEnvironment::new("stress-100k");
+
+    const NUM_KEYS: usize = 100;
+    const RECORDS_PER_KEY: i64 = 1000;
+
+    // Round-robin to mix keys (simulates interleaved record arrival).
+    let data: Vec<(usize, i64)> = (0..RECORDS_PER_KEY)
+        .flat_map(|_| (0..NUM_KEYS).map(|k| (k, 1i64)))
+        .collect();
+
+    assert_eq!(data.len(), (NUM_KEYS as i64 * RECORDS_PER_KEY) as usize);
+
+    let results = env
+        .from_iter(data)
+        .key_by(|(k, _): &(usize, i64)| *k)
+        .reduce(|(k, c1), (_, c2)| (k, c1 + c2))
+        .execute_with_parallelism(8)
+        .unwrap();
+
+    let final_results = results.lock().unwrap();
+
+    // All 100 keys must appear (no key routed to wrong subtask).
+    assert_eq!(
+        final_results.len(),
+        NUM_KEYS,
+        "expected {} unique keys, got {}",
+        NUM_KEYS,
+        final_results.len()
+    );
+
+    // Each key must accumulate exactly RECORDS_PER_KEY (no data loss).
+    for key in 0..NUM_KEYS {
+        let (_, count) = final_results
+            .get(&key)
+            .unwrap_or_else(|| panic!("key {} is missing from results", key));
+        assert_eq!(
+            *count, RECORDS_PER_KEY,
+            "key {} lost data: expected {}, got {}",
+            key, RECORDS_PER_KEY, count
+        );
+    }
+}
+
 /// Chained map + filter + key_by + reduce.
 /// Verifies multi-step stateless transformations compose correctly with stateful reduce.
 #[test]
