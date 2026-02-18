@@ -79,8 +79,12 @@ where
     ///     Ok(())
     /// }
     /// ```
-    fn process_element(&mut self, key: &K, value: IN, ctx: &mut ProcessContext<OUT, B>)
-        -> Result<()>;
+    fn process_element(
+        &mut self,
+        key: &K,
+        value: IN,
+        ctx: &mut ProcessContext<OUT, B>,
+    ) -> Result<()>;
 }
 
 /// Context for process functions.
@@ -239,11 +243,7 @@ where
 {
     type OUT = OUT;
 
-    fn process_batch(
-        &mut self,
-        input: &[(K, IN)],
-        output: &mut Vec<Self::OUT>,
-    ) -> Result<()> {
+    fn process_batch(&mut self, input: &[(K, IN)], output: &mut Vec<Self::OUT>) -> Result<()> {
         // Reserve capacity for output (worst case: one output per input)
         output.reserve(input.len());
 
@@ -261,7 +261,8 @@ where
             // Call user's process function
             // Note: value is cloned here because we need to pass ownership
             // Future optimization: use references or Copy types
-            self.process_fn.process_element(key, value.clone(), &mut ctx)?;
+            self.process_fn
+                .process_element(key, value.clone(), &mut ctx)?;
         }
 
         Ok(())
@@ -333,11 +334,7 @@ where
 {
     type OUT = (K, T);
 
-    fn process_batch(
-        &mut self,
-        input: &[(K, T)],
-        output: &mut Vec<Self::OUT>,
-    ) -> Result<()> {
+    fn process_batch(&mut self, input: &[(K, T)], output: &mut Vec<Self::OUT>) -> Result<()> {
         // Reserve capacity for output (one output per input)
         output.reserve(input.len());
 
@@ -365,7 +362,8 @@ where
             };
 
             // Store new value
-            self.value_state.put(&mut self.state_backend, new_value.clone())?;
+            self.value_state
+                .put(&mut self.state_backend, new_value.clone())?;
 
             // Emit result
             output.push((key.clone(), new_value));
@@ -397,9 +395,7 @@ mod tests {
         }
     }
 
-    impl KeyedProcessFunction<String, i32, (String, i64), HashMapStateBackend>
-        for CountAggregator
-    {
+    impl KeyedProcessFunction<String, i32, (String, i64), HashMapStateBackend> for CountAggregator {
         fn process_element(
             &mut self,
             key: &String,
@@ -477,10 +473,7 @@ mod tests {
         let mut operator = ProcessOperator::new(aggregator, backend);
 
         // First batch
-        let input1 = vec![
-            ("user_1".to_string(), 10),
-            ("user_2".to_string(), 20),
-        ];
+        let input1 = vec![("user_1".to_string(), 10), ("user_2".to_string(), 20)];
         let mut output1 = Vec::new();
         operator.process_batch(&input1, &mut output1).unwrap();
 
@@ -488,10 +481,7 @@ mod tests {
         assert_eq!(output1[1], ("user_2".to_string(), 1));
 
         // Second batch (state should persist)
-        let input2 = vec![
-            ("user_1".to_string(), 30),
-            ("user_2".to_string(), 40),
-        ];
+        let input2 = vec![("user_1".to_string(), 30), ("user_2".to_string(), 40)];
         let mut output2 = Vec::new();
         operator.process_batch(&input2, &mut output2).unwrap();
 
@@ -515,9 +505,7 @@ mod tests {
         }
     }
 
-    impl KeyedProcessFunction<String, i32, (String, i64, i64), HashMapStateBackend>
-        for SumAggregator
-    {
+    impl KeyedProcessFunction<String, i32, (String, i64, i64), HashMapStateBackend> for SumAggregator {
         fn process_element(
             &mut self,
             key: &String,
@@ -591,9 +579,9 @@ mod tests {
 
         // Should emit cumulative sum after each element
         assert_eq!(output.len(), 3);
-        assert_eq!(output[0], ("user_1".to_string(), 10));  // First value
-        assert_eq!(output[1], ("user_1".to_string(), 30));  // 10 + 20
-        assert_eq!(output[2], ("user_1".to_string(), 60));  // 30 + 30
+        assert_eq!(output[0], ("user_1".to_string(), 10)); // First value
+        assert_eq!(output[1], ("user_1".to_string(), 30)); // 10 + 20
+        assert_eq!(output[2], ("user_1".to_string(), 60)); // 30 + 30
     }
 
     #[test]
@@ -617,8 +605,8 @@ mod tests {
         assert_eq!(output.len(), 5);
         assert_eq!(output[0], ("user_1".to_string(), 10));
         assert_eq!(output[1], ("user_2".to_string(), 100));
-        assert_eq!(output[2], ("user_1".to_string(), 30));   // 10 + 20
-        assert_eq!(output[3], ("user_2".to_string(), 300));  // 100 + 200
+        assert_eq!(output[2], ("user_1".to_string(), 30)); // 10 + 20
+        assert_eq!(output[3], ("user_2".to_string(), 300)); // 100 + 200
         assert_eq!(output[4], ("user_3".to_string(), 1000));
     }
 
@@ -629,10 +617,7 @@ mod tests {
         let mut operator = ReduceOperator::new(reducer, backend);
 
         // First batch
-        let input1 = vec![
-            ("user_1".to_string(), 10),
-            ("user_2".to_string(), 100),
-        ];
+        let input1 = vec![("user_1".to_string(), 10), ("user_2".to_string(), 100)];
         let mut output1 = Vec::new();
         operator.process_batch(&input1, &mut output1).unwrap();
 
@@ -640,16 +625,13 @@ mod tests {
         assert_eq!(output1[1], ("user_2".to_string(), 100));
 
         // Second batch (state should persist)
-        let input2 = vec![
-            ("user_1".to_string(), 20),
-            ("user_2".to_string(), 200),
-        ];
+        let input2 = vec![("user_1".to_string(), 20), ("user_2".to_string(), 200)];
         let mut output2 = Vec::new();
         operator.process_batch(&input2, &mut output2).unwrap();
 
         // Sums should continue from previous batch
-        assert_eq!(output2[0], ("user_1".to_string(), 30));   // 10 + 20
-        assert_eq!(output2[1], ("user_2".to_string(), 300));  // 100 + 200
+        assert_eq!(output2[0], ("user_1".to_string(), 30)); // 10 + 20
+        assert_eq!(output2[1], ("user_2".to_string(), 300)); // 100 + 200
     }
 
     /// Example: Max reducer
@@ -670,7 +652,7 @@ mod tests {
         let input = vec![
             ("user_1".to_string(), 10),
             ("user_1".to_string(), 30),
-            ("user_1".to_string(), 20),  // Smaller than current max
+            ("user_1".to_string(), 20), // Smaller than current max
             ("user_1".to_string(), 50),
         ];
 
@@ -681,8 +663,7 @@ mod tests {
         assert_eq!(output.len(), 4);
         assert_eq!(output[0], ("user_1".to_string(), 10));
         assert_eq!(output[1], ("user_1".to_string(), 30));
-        assert_eq!(output[2], ("user_1".to_string(), 30));  // Max stays 30
+        assert_eq!(output[2], ("user_1".to_string(), 30)); // Max stays 30
         assert_eq!(output[3], ("user_1".to_string(), 50));
     }
 }
-

@@ -7,7 +7,7 @@
 
 use crate::channel::LocalChannelReceiver;
 use crate::types::StreamElement;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use crossbeam_channel::Select;
 
 /// Channel identifier (index in the input gate).
@@ -20,10 +20,10 @@ pub type ChannelIndex = usize;
 pub struct InputGate<T> {
     /// Input channels from upstream tasks
     channels: Vec<LocalChannelReceiver<T>>,
-    
+
     /// Track which channels have ended (received StreamElement::End)
     ended_channels: Vec<bool>,
-    
+
     /// Number of channels that have ended
     ended_count: usize,
 }
@@ -77,12 +77,12 @@ impl<T> InputGate<T> {
             // Check if this is an End marker
             if matches!(element, StreamElement::End) {
                 self.mark_ended(channel_idx);
-                
+
                 // If all channels ended, return the End marker
                 if self.ended_count == self.channels.len() {
                     return Ok((channel_idx, element));
                 }
-                
+
                 // Otherwise, continue to next iteration to read from other channels
                 continue;
             }
@@ -221,4 +221,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

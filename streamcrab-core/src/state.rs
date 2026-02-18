@@ -225,4 +225,3 @@ pub trait KeyedStateBackend: Send {
     /// Restore state from a checkpoint.
     fn restore(&mut self, data: &[u8]) -> Result<()>;
 }
-

@@ -4,7 +4,7 @@
 
 use super::KeyedStateBackend;
 use crate::types::StreamData;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -57,7 +57,9 @@ impl KeyedStateBackend for HashMapStateBackend {
     // ========== ValueState operations ==========
 
     fn get_value<V: StreamData>(&self, name: &str) -> Result<Option<V>> {
-        let key = self.current_key.as_ref()
+        let key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?;
         let state_key = (key.clone(), name.to_string());
 
@@ -68,7 +70,9 @@ impl KeyedStateBackend for HashMapStateBackend {
     }
 
     fn put_value<V: StreamData>(&mut self, name: &str, value: V) -> Result<()> {
-        let key = self.current_key.as_ref()
+        let key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (key, name.to_string());
@@ -78,7 +82,9 @@ impl KeyedStateBackend for HashMapStateBackend {
     }
 
     fn clear_value(&mut self, name: &str) -> Result<()> {
-        let key = self.current_key.as_ref()
+        let key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (key, name.to_string());
@@ -89,7 +95,9 @@ impl KeyedStateBackend for HashMapStateBackend {
     // ========== ListState operations ==========
 
     fn get_list<V: StreamData>(&self, name: &str) -> Result<Vec<V>> {
-        let key = self.current_key.as_ref()
+        let key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?;
         let state_key = (key.clone(), name.to_string());
 
@@ -106,18 +114,25 @@ impl KeyedStateBackend for HashMapStateBackend {
     }
 
     fn add_to_list<V: StreamData>(&mut self, name: &str, value: V) -> Result<()> {
-        let key = self.current_key.as_ref()
+        let key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (key, name.to_string());
         let bytes = bincode::serialize(&value)?;
 
-        self.list_states.entry(state_key).or_insert_with(Vec::new).push(bytes);
+        self.list_states
+            .entry(state_key)
+            .or_insert_with(Vec::new)
+            .push(bytes);
         Ok(())
     }
 
     fn clear_list(&mut self, name: &str) -> Result<()> {
-        let key = self.current_key.as_ref()
+        let key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (key, name.to_string());
@@ -132,7 +147,9 @@ impl KeyedStateBackend for HashMapStateBackend {
         K: StreamData + std::hash::Hash + Eq,
         V: StreamData,
     {
-        let current_key = self.current_key.as_ref()
+        let current_key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?;
         let state_key = (current_key.clone(), name.to_string());
         let kbytes = bincode::serialize(key)?;
@@ -151,7 +168,9 @@ impl KeyedStateBackend for HashMapStateBackend {
         K: StreamData + std::hash::Hash + Eq,
         V: StreamData,
     {
-        let current_key = self.current_key.as_ref()
+        let current_key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (current_key, name.to_string());
@@ -170,7 +189,9 @@ impl KeyedStateBackend for HashMapStateBackend {
         K: StreamData + std::hash::Hash + Eq,
         V: StreamData,
     {
-        let current_key = self.current_key.as_ref()
+        let current_key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (current_key, name.to_string());
@@ -186,7 +207,9 @@ impl KeyedStateBackend for HashMapStateBackend {
     }
 
     fn clear_map(&mut self, name: &str) -> Result<()> {
-        let current_key = self.current_key.as_ref()
+        let current_key = self
+            .current_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No current key set"))?
             .clone();
         let state_key = (current_key, name.to_string());
@@ -222,7 +245,7 @@ impl KeyedStateBackend for HashMapStateBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ValueStateHandle, ListStateHandle, MapStateHandle};
+    use crate::state::{ListStateHandle, MapStateHandle, ValueStateHandle};
 
     #[test]
     fn test_value_state() {
@@ -301,8 +324,14 @@ mod tests {
 
         metrics.put(&mut backend, "clicks".to_string(), 10).unwrap();
         metrics.put(&mut backend, "views".to_string(), 100).unwrap();
-        assert_eq!(metrics.get(&backend, &"clicks".to_string()).unwrap(), Some(10));
-        assert_eq!(metrics.get(&backend, &"views".to_string()).unwrap(), Some(100));
+        assert_eq!(
+            metrics.get(&backend, &"clicks".to_string()).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            metrics.get(&backend, &"views".to_string()).unwrap(),
+            Some(100)
+        );
 
         let removed = metrics.remove(&mut backend, &"clicks".to_string()).unwrap();
         assert_eq!(removed, Some(10));
@@ -343,11 +372,16 @@ mod tests {
         // Verify restored values
         new_backend.set_current_key(b"user_1".to_vec());
         assert_eq!(count.get(&new_backend).unwrap(), Some(42));
-        assert_eq!(events.get(&new_backend).unwrap(), vec!["e1".to_string(), "e2".to_string()]);
-        assert_eq!(metrics.get(&new_backend, &"clicks".to_string()).unwrap(), Some(7));
+        assert_eq!(
+            events.get(&new_backend).unwrap(),
+            vec!["e1".to_string(), "e2".to_string()]
+        );
+        assert_eq!(
+            metrics.get(&new_backend, &"clicks".to_string()).unwrap(),
+            Some(7)
+        );
 
         new_backend.set_current_key(b"user_2".to_vec());
         assert_eq!(count.get(&new_backend).unwrap(), Some(100));
     }
 }
-

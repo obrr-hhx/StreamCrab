@@ -197,7 +197,10 @@ fn main() -> Result<()> {
                     StreamElement::End => {
                         // Forward End marker
                         sender.send(StreamElement::End)?;
-                        println!("[Reduce-{}] Finished processing {} records", task_id, processed);
+                        println!(
+                            "[Reduce-{}] Finished processing {} records",
+                            task_id, processed
+                        );
                         break;
                     }
                     _ => {}
@@ -260,8 +263,15 @@ fn main() -> Result<()> {
     for key in keys {
         let value = final_results[key];
         let expected_value = expected[key];
-        let status = if value == expected_value { "✓" } else { "✗" };
-        println!("  {} {} -> {} (expected: {})", status, key, value, expected_value);
+        let status = if value == expected_value {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "  {} {} -> {} (expected: {})",
+            status, key, value, expected_value
+        );
     }
 
     // Validate
@@ -273,7 +283,10 @@ fn main() -> Result<()> {
                 println!("  ✓ {} correct", key);
             }
             Some(&actual_value) => {
-                println!("  ✗ {} incorrect: got {}, expected {}", key, actual_value, expected_value);
+                println!(
+                    "  ✗ {} incorrect: got {}, expected {}",
+                    key, actual_value, expected_value
+                );
                 all_correct = false;
             }
             None => {
@@ -292,4 +305,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-

@@ -32,7 +32,10 @@ fn test_wordcount() {
         Some(&("streamcrab".to_string(), 1))
     );
     assert_eq!(final_counts.get("of"), Some(&("of".to_string(), 1)));
-    assert_eq!(final_counts.get("streams"), Some(&("streams".to_string(), 1)));
+    assert_eq!(
+        final_counts.get("streams"),
+        Some(&("streams".to_string(), 1))
+    );
     assert_eq!(final_counts.len(), 5);
 }
 
@@ -93,9 +96,15 @@ fn test_wordcount_with_flat_map() {
     let final_counts = results.lock().unwrap();
     assert_eq!(final_counts.get("hello"), Some(&("hello".to_string(), 2)));
     assert_eq!(final_counts.get("world"), Some(&("world".to_string(), 2)));
-    assert_eq!(final_counts.get("streamcrab"), Some(&("streamcrab".to_string(), 1)));
+    assert_eq!(
+        final_counts.get("streamcrab"),
+        Some(&("streamcrab".to_string(), 1))
+    );
     assert_eq!(final_counts.get("of"), Some(&("of".to_string(), 1)));
-    assert_eq!(final_counts.get("streams"), Some(&("streams".to_string(), 1)));
+    assert_eq!(
+        final_counts.get("streams"),
+        Some(&("streams".to_string(), 1))
+    );
     assert_eq!(final_counts.len(), 5);
 }
 

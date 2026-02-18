@@ -121,7 +121,11 @@ mod tests {
         // Check that distribution is reasonably balanced
         // Each partition should get roughly 250 records (1000 / 4)
         for count in counts {
-            assert!(count > 200 && count < 300, "Unbalanced distribution: {}", count);
+            assert!(
+                count > 200 && count < 300,
+                "Unbalanced distribution: {}",
+                count
+            );
         }
     }
 
@@ -156,4 +160,3 @@ mod tests {
         assert_eq!(partitioner.partition(&rec, 4), 0);
     }
 }
-

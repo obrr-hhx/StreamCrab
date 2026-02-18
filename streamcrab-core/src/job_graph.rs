@@ -52,7 +52,11 @@ impl JobGraph {
     }
 
     /// Add a vertex and return its ID.
-    pub fn add_vertex(&mut self, chained_operators: Vec<OperatorDescriptor>, parallelism: usize) -> VertexId {
+    pub fn add_vertex(
+        &mut self,
+        chained_operators: Vec<OperatorDescriptor>,
+        parallelism: usize,
+    ) -> VertexId {
         let id = self.next_vertex_id;
         self.next_vertex_id += 1;
         self.vertices.insert(
@@ -272,9 +276,15 @@ mod tests {
 
         let vertex = job_graph.vertices.values().next().unwrap();
         assert_eq!(vertex.chained_operators.len(), 3);
-        assert_eq!(vertex.chained_operators[0].operator_type, OperatorType::Source);
+        assert_eq!(
+            vertex.chained_operators[0].operator_type,
+            OperatorType::Source
+        );
         assert_eq!(vertex.chained_operators[1].operator_type, OperatorType::Map);
-        assert_eq!(vertex.chained_operators[2].operator_type, OperatorType::Filter);
+        assert_eq!(
+            vertex.chained_operators[2].operator_type,
+            OperatorType::Filter
+        );
     }
 
     #[test]
@@ -348,4 +358,3 @@ mod tests {
         assert!(!can_chain(&stream_graph, map, keyby));
     }
 }
-

@@ -47,6 +47,12 @@ impl Watermark {
     }
 }
 
+impl std::fmt::Display for Watermark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Watermark({}ms)", self.timestamp)
+    }
+}
+
 /// Checkpoint barrier for Chandy-Lamport snapshots.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Barrier {

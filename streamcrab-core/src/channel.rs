@@ -4,8 +4,8 @@
 //! between Task instances running in different threads.
 
 use crate::types::StreamElement;
-use anyhow::{anyhow, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 /// Default channel buffer size (bounded for backpressure).
 ///
@@ -201,4 +201,3 @@ mod tests {
         );
     }
 }
-

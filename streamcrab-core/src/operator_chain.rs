@@ -5,7 +5,7 @@
 //! This implementation demonstrates **zero-cost abstraction** through:
 //! 1. **Static dispatch** (compile-time monomorphization, no vtable)
 //! 2. **Batch processing** (amortize function call overhead)
-//! 3. **Push-based pipeline** (v2: eliminate intermediate materialization) 
+//! 3. **Push-based pipeline** (v2: eliminate intermediate materialization)
 //! 4. **Inline-friendly** (LLVM can fuse entire chain into tight loop)
 //!
 //! ## Performance Comparison
@@ -162,9 +162,9 @@ impl<T> Operator<T> for ChainEnd
 where
     T: Clone + Send,
 {
-    type OUT = T;  // Identity: output type = input type
+    type OUT = T; // Identity: output type = input type
 
-    #[inline(always)]  // Force inline for zero overhead
+    #[inline(always)] // Force inline for zero overhead
     fn process_batch(&mut self, input: &[T], output: &mut Vec<T>) -> Result<()> {
         output.extend_from_slice(input);
         Ok(())
@@ -189,11 +189,11 @@ where
 impl<IN, Head, Tail> Operator<IN> for Chain<Head, Tail>
 where
     Head: Operator<IN>,
-    Tail: Operator<Head::OUT>,  // MID = Head::OUT, uniquely determined!
+    Tail: Operator<Head::OUT>, // MID = Head::OUT, uniquely determined!
 {
-    type OUT = Tail::OUT;  // Final output type
+    type OUT = Tail::OUT; // Final output type
 
-    #[inline]  // Let LLVM decide whether to inline (usually yes for short chains)
+    #[inline] // Let LLVM decide whether to inline (usually yes for short chains)
     fn process_batch(&mut self, input: &[IN], output: &mut Vec<Self::OUT>) -> Result<()> {
         // Intermediate buffer (TODO: reuse via ping-pong or thread_local)
         // Note: Vec<T> does not require T: Clone, only when we clone elements
@@ -400,10 +400,9 @@ mod tests {
     #[test]
     fn test_map_then_filter() {
         // Chain: x * 2 → filter(x > 5)
-        let mut chain = chain(MapOp::new(|x: &i32| x * 2))
-            .then(FilterOp::new(|x: &i32| *x > 5));
+        let mut chain = chain(MapOp::new(|x: &i32| x * 2)).then(FilterOp::new(|x: &i32| *x > 5));
 
-        let input = vec![1, 2, 3, 4, 5];  // → [2, 4, 6, 8, 10] → [6, 8, 10]
+        let input = vec![1, 2, 3, 4, 5]; // → [2, 4, 6, 8, 10] → [6, 8, 10]
         let mut output = Vec::new();
 
         chain.process_batch(&input, &mut output).unwrap();
@@ -431,7 +430,9 @@ mod tests {
 
     #[test]
     fn test_filter_removes_all() {
-        let filter = FilterOp { f: |x: &i32| *x > 100 };
+        let filter = FilterOp {
+            f: |x: &i32| *x > 100,
+        };
         let mut chain = chain(filter);
 
         let input = vec![1, 2, 3, 4, 5];
@@ -479,7 +480,7 @@ mod tests {
         for batch_id in 0..10 {
             let input: Vec<i32> = (batch_id * 10..(batch_id + 1) * 10).collect();
 
-            output.clear();  // Reuse buffer (no deallocation)
+            output.clear(); // Reuse buffer (no deallocation)
             chain.process_batch(&input, &mut output).unwrap();
 
             assert_eq!(output.len(), 10);
