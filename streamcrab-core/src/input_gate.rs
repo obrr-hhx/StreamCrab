@@ -9,6 +9,7 @@ use crate::channel::LocalChannelReceiver;
 use crate::types::StreamElement;
 use anyhow::{Result, anyhow};
 use crossbeam_channel::Select;
+use std::time::Duration;
 
 /// Channel identifier (index in the input gate).
 pub type ChannelIndex = usize;
@@ -26,6 +27,9 @@ pub struct InputGate<T> {
 
     /// Number of channels that have ended
     ended_count: usize,
+
+    /// Channels that newly transitioned to ended state since last drain.
+    newly_ended_channels: Vec<ChannelIndex>,
 }
 
 impl<T> InputGate<T> {
@@ -36,6 +40,7 @@ impl<T> InputGate<T> {
             channels,
             ended_channels: vec![false; num_channels],
             ended_count: 0,
+            newly_ended_channels: Vec::new(),
         }
     }
 
@@ -91,6 +96,54 @@ impl<T> InputGate<T> {
         }
     }
 
+    /// Get the next stream element with timeout.
+    ///
+    /// Returns:
+    /// - `Ok(Some((channel, element)))` when an element is received
+    /// - `Ok(None)` on timeout
+    /// - `Err(...)` when all channels ended or channel closed unexpectedly
+    pub fn next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(ChannelIndex, StreamElement<T>)>> {
+        if self.ended_count == self.channels.len() {
+            return Err(anyhow!("All input channels have ended"));
+        }
+
+        loop {
+            let mut select = Select::new();
+            let mut active_indices = Vec::new();
+
+            for (idx, receiver) in self.channels.iter().enumerate() {
+                if !self.ended_channels[idx] {
+                    select.recv(&receiver.receiver);
+                    active_indices.push(idx);
+                }
+            }
+
+            let oper = match select.select_timeout(timeout) {
+                Ok(oper) => oper,
+                Err(_) => return Ok(None),
+            };
+
+            let selected_idx = oper.index();
+            let channel_idx = active_indices[selected_idx];
+            let element = oper
+                .recv(&self.channels[channel_idx].receiver)
+                .map_err(|_| anyhow!("Channel {} closed unexpectedly", channel_idx))?;
+
+            if matches!(element, StreamElement::End) {
+                self.mark_ended(channel_idx);
+                if self.ended_count == self.channels.len() {
+                    return Ok(Some((channel_idx, element)));
+                }
+                continue;
+            }
+
+            return Ok(Some((channel_idx, element)));
+        }
+    }
+
     /// Mark a channel as ended.
     ///
     /// Called when StreamElement::End is received from a channel.
@@ -98,7 +151,16 @@ impl<T> InputGate<T> {
         if !self.ended_channels[channel_idx] {
             self.ended_channels[channel_idx] = true;
             self.ended_count += 1;
+            self.newly_ended_channels.push(channel_idx);
         }
+    }
+
+    /// Drain channels that became ended since last call.
+    ///
+    /// This allows the task loop to observe non-terminal End markers that are
+    /// otherwise consumed internally by [`next`](Self::next) / [`next_timeout`](Self::next_timeout).
+    pub fn drain_newly_ended_channels(&mut self) -> Vec<ChannelIndex> {
+        std::mem::take(&mut self.newly_ended_channels)
     }
 
     /// Check if all input channels have ended.
@@ -219,5 +281,40 @@ mod tests {
         // Next call should error
         let result = gate.next();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_input_gate_next_timeout() {
+        let (sender, receiver) = local_channel::<i32>(10);
+        let mut gate = InputGate::new(vec![receiver]);
+
+        // No input available yet -> timeout.
+        let timed = gate
+            .next_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        assert!(timed.is_none());
+
+        // Send data and ensure timeout API can read it.
+        sender.send(StreamElement::record(7)).unwrap();
+        let got = gate
+            .next_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        assert!(matches!(got, Some((0, StreamElement::Record(_)))));
+    }
+
+    #[test]
+    fn test_input_gate_drain_newly_ended_channels_once() {
+        let (_sender1, receiver1) = local_channel::<i32>(10);
+        let (_sender2, receiver2) = local_channel::<i32>(10);
+        let mut gate = InputGate::new(vec![receiver1, receiver2]);
+
+        gate.mark_ended(0);
+        let ended = gate.drain_newly_ended_channels();
+        assert_eq!(ended, vec![0]);
+        assert!(gate.drain_newly_ended_channels().is_empty());
+
+        gate.mark_ended(1);
+        let ended = gate.drain_newly_ended_channels();
+        assert_eq!(ended, vec![1]);
     }
 }

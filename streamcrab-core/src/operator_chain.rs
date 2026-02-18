@@ -73,11 +73,21 @@
 //! 4. **Selection vector**: Filter uses bitmap instead of cloning records
 //! 5. **Hot path error handling**: Replace `anyhow::Result` with small enum
 
+use crate::types::EventTime;
 use anyhow::Result;
 
 // ============================================================================
 // Core Operator Trait: Batch + Push-based + Associated Type
 // ============================================================================
+
+/// Timer domain for unified timer callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerDomain {
+    /// Event-time timer (usually driven by watermarks).
+    EventTime,
+    /// Processing-time timer (driven by wall-clock ticks).
+    ProcessingTime,
+}
 
 /// Operator trait for high-performance batch processing.
 ///
@@ -106,6 +116,44 @@ pub trait Operator<IN>: Send {
     ///
     /// The output buffer is reused across batches (caller clears it).
     fn process_batch(&mut self, input: &[IN], output: &mut Vec<Self::OUT>) -> Result<()>;
+
+    /// Unified timer callback.
+    ///
+    /// Runtime should call this API directly. The default implementation routes
+    /// to domain-specific callbacks for backward compatibility.
+    fn on_timer(
+        &mut self,
+        timestamp: EventTime,
+        domain: TimerDomain,
+        output: &mut Vec<Self::OUT>,
+    ) -> Result<()> {
+        match domain {
+            TimerDomain::EventTime => self.on_event_time(timestamp, output),
+            TimerDomain::ProcessingTime => self.on_processing_time(timestamp, output),
+        }
+    }
+
+    /// Optional event-time callback.
+    ///
+    /// Default implementation is a no-op.
+    fn on_event_time(
+        &mut self,
+        _event_time: EventTime,
+        _output: &mut Vec<Self::OUT>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Optional processing-time callback.
+    ///
+    /// Default implementation is a no-op.
+    fn on_processing_time(
+        &mut self,
+        _processing_time: EventTime,
+        _output: &mut Vec<Self::OUT>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -169,6 +217,25 @@ where
         output.extend_from_slice(input);
         Ok(())
     }
+
+    #[inline(always)]
+    fn on_timer(
+        &mut self,
+        _timestamp: EventTime,
+        _domain: TimerDomain,
+        _output: &mut Vec<T>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn on_processing_time(
+        &mut self,
+        _processing_time: EventTime,
+        _output: &mut Vec<T>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Chain<Head, Tail>: recursive case
@@ -211,6 +278,31 @@ where
         self.tail.process_batch(&intermediate, output)?;
 
         Ok(())
+    }
+
+    #[inline]
+    fn on_timer(
+        &mut self,
+        timestamp: EventTime,
+        domain: TimerDomain,
+        output: &mut Vec<Self::OUT>,
+    ) -> Result<()> {
+        let mut intermediate = Vec::new();
+        self.head.on_timer(timestamp, domain, &mut intermediate)?;
+        if !intermediate.is_empty() {
+            self.tail.process_batch(&intermediate, output)?;
+        }
+        self.tail.on_timer(timestamp, domain, output)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn on_processing_time(
+        &mut self,
+        processing_time: EventTime,
+        output: &mut Vec<Self::OUT>,
+    ) -> Result<()> {
+        self.on_timer(processing_time, TimerDomain::ProcessingTime, output)
     }
 }
 
@@ -489,5 +581,48 @@ mod tests {
 
         // Key point: Only 1 allocation (initial with_capacity)
         // All subsequent batches reuse the same buffer!
+    }
+
+    struct EventTimerHead;
+
+    impl Operator<i32> for EventTimerHead {
+        type OUT = i32;
+
+        fn process_batch(&mut self, _input: &[i32], _output: &mut Vec<i32>) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_event_time(&mut self, event_time: EventTime, output: &mut Vec<i32>) -> Result<()> {
+            output.push(event_time as i32);
+            Ok(())
+        }
+    }
+
+    struct EventTimerTail;
+
+    impl Operator<i32> for EventTimerTail {
+        type OUT = i32;
+
+        fn process_batch(&mut self, input: &[i32], output: &mut Vec<i32>) -> Result<()> {
+            output.extend_from_slice(input);
+            Ok(())
+        }
+
+        fn on_event_time(&mut self, _event_time: EventTime, output: &mut Vec<i32>) -> Result<()> {
+            output.push(99);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_chain_on_timer_event_time_propagates() {
+        let mut chain = chain(EventTimerHead).then(EventTimerTail);
+        let mut output = Vec::new();
+
+        chain
+            .on_timer(7, TimerDomain::EventTime, &mut output)
+            .unwrap();
+
+        assert_eq!(output, vec![7, 99]);
     }
 }

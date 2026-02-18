@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use streamcrab_core::operator_chain::{Append, ChainEnd, FilterOp, FlatMapOp, MapOp, Operator};
 use streamcrab_core::time::WatermarkStrategy;
-use streamcrab_core::types::StreamData;
-use streamcrab_core::window::{EventTimeTrigger, TimeWindow, Trigger, WindowAssigner};
+use streamcrab_core::types::{EventTime, StreamData};
+use streamcrab_core::window::{TimeWindow, Trigger, WindowAssigner};
 
 /// A stream of elements of type `T` with an operator chain of type `OpChain`.
 ///
@@ -30,7 +30,8 @@ where
     /// Assign event-time timestamps and watermarks to this stream.
     ///
     /// This returns a wrapper stream that carries a [`WatermarkStrategy`].
-    /// Windowing APIs can then use the strategy during execution.
+    /// Windowing APIs use it to insert a timestamp-assigner execution stage
+    /// and drive watermark generation.
     pub fn assign_timestamps_and_watermarks<Strategy>(
         self,
         strategy: Strategy,
@@ -107,6 +108,34 @@ where
     }
 }
 
+/// Timestamp-assigner stage used by window execution.
+///
+/// It is modelled as a dedicated execution-stage operator so timestamp extraction
+/// and watermark generation are explicit in the pipeline.
+struct TimestampAssignerOperator<Strategy> {
+    strategy: Strategy,
+}
+
+impl<Strategy> TimestampAssignerOperator<Strategy> {
+    fn new(strategy: Strategy) -> Self {
+        Self { strategy }
+    }
+
+    fn extract_timestamp<T>(&self, element: &T) -> EventTime
+    where
+        Strategy: WatermarkStrategy<T>,
+    {
+        self.strategy.extract_timestamp(element)
+    }
+
+    fn create_watermark_generator<T>(&self) -> Box<dyn streamcrab_core::time::WatermarkGenerator>
+    where
+        Strategy: WatermarkStrategy<T>,
+    {
+        self.strategy.create_watermark_generator()
+    }
+}
+
 /// A stream that has an event-time [`WatermarkStrategy`] assigned.
 ///
 /// Created by calling [`DataStream::assign_timestamps_and_watermarks`].
@@ -168,17 +197,18 @@ where
     pub fn window<WA>(
         self,
         assigner: WA,
-    ) -> WindowedStream<K, T, OpChain, KeyFn, Strategy, WA, EventTimeTrigger>
+    ) -> WindowedStream<K, T, OpChain, KeyFn, Strategy, WA, WA::DefaultTrigger>
     where
         WA: WindowAssigner<OpChain::OUT> + 'static,
     {
+        let trigger = assigner.default_trigger();
         WindowedStream {
             source_data: self.source_data,
             op_chain: self.op_chain,
             key_fn: self.key_fn,
             strategy: self.strategy,
             assigner,
-            trigger: EventTimeTrigger,
+            trigger,
             _phantom: PhantomData,
         }
     }
@@ -364,6 +394,7 @@ where
     ///
     /// This is sufficient for P2 correctness tests; parallel execution is added in later phases.
     pub fn execute(mut self) -> anyhow::Result<Vec<streamcrab_core::types::StreamRecord<OUT>>> {
+        use std::time::{SystemTime, UNIX_EPOCH};
         use streamcrab_core::time::EVENT_TIME_MAX;
         use streamcrab_core::types::{StreamElement, StreamRecord, Watermark};
         use streamcrab_core::window::WindowOperator;
@@ -373,12 +404,13 @@ where
         self.op_chain
             .process_batch(&self.source_data, &mut transformed)?;
 
-        // Step 2: Create watermark generator.
-        let mut generator = self.strategy.create_watermark_generator();
+        // Step 2: TimestampAssigner operator + watermark generator.
+        let timestamp_assigner = TimestampAssignerOperator::new(self.strategy);
+        let mut generator = timestamp_assigner.create_watermark_generator::<OpChain::OUT>();
         let mut last_emitted_wm = streamcrab_core::time::EVENT_TIME_MIN;
 
-        let strategy_ref = &self.strategy;
-        let timestamp_fn = move |e: &OpChain::OUT| strategy_ref.extract_timestamp(e);
+        let timestamp_assigner_ref = &timestamp_assigner;
+        let timestamp_fn = move |e: &OpChain::OUT| timestamp_assigner_ref.extract_timestamp(e);
 
         let mut operator = WindowOperator::new(
             self.key_fn,
@@ -389,9 +421,15 @@ where
         );
 
         let mut out_records: Vec<StreamRecord<OUT>> = Vec::new();
+        let processing_time_ms = || -> i64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
 
         for item in transformed {
-            let ts = self.strategy.extract_timestamp(&item);
+            let ts = timestamp_assigner.extract_timestamp(&item);
 
             // Drop late elements (v1: no allowed lateness).
             if ts <= last_emitted_wm {
@@ -414,6 +452,12 @@ where
                             out_records.push(r);
                         }
                     }
+                }
+            }
+
+            for elem in operator.on_processing_time(processing_time_ms())? {
+                if let StreamElement::Record(r) = elem {
+                    out_records.push(r);
                 }
             }
         }
@@ -502,14 +546,14 @@ where
 
         // Spawn Source Task.
         let source_key_fn = self.key_fn.clone();
-        let strategy = self.strategy;
+        let timestamp_assigner = TimestampAssignerOperator::new(self.strategy);
         let source_handle = thread::spawn(move || -> anyhow::Result<()> {
             let partitioner = HashPartitioner::new(source_key_fn);
-            let mut generator = strategy.create_watermark_generator();
+            let mut generator = timestamp_assigner.create_watermark_generator::<OpChain::OUT>();
             let mut last_emitted_wm = streamcrab_core::time::EVENT_TIME_MIN;
 
             for item in transformed_data {
-                let ts = strategy.extract_timestamp(&item);
+                let ts = timestamp_assigner.extract_timestamp(&item);
 
                 // Drop late elements (v1: no allowed lateness).
                 if ts <= last_emitted_wm {
@@ -554,6 +598,7 @@ where
             let window_fn = self.window_fn.clone();
 
             let handle = thread::spawn(move || -> anyhow::Result<()> {
+                use std::time::{SystemTime, UNIX_EPOCH};
                 let mut operator = WindowOperator::new(
                     key_fn,
                     |_e: &OpChain::OUT| 0i64,
@@ -561,12 +606,22 @@ where
                     trigger,
                     window_fn,
                 );
+                let processing_time_ms = || -> i64 {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                };
 
                 loop {
                     let element = receiver.recv()?;
                     let is_end = matches!(element, StreamElement::End);
 
                     for out in operator.process(element)? {
+                        sender.send(out)?;
+                    }
+
+                    for out in operator.on_processing_time(processing_time_ms())? {
                         sender.send(out)?;
                     }
 

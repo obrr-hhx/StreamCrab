@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::time::{EVENT_TIME_MAX, EVENT_TIME_MIN};
+use crate::time::{EVENT_TIME_MAX, EVENT_TIME_MIN, TimerService};
 use crate::types::{EventTime, StreamData, StreamElement};
 
 /// A half-open event-time window `[start, end)`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TimeWindow {
     pub start: EventTime,
     pub end: EventTime,
@@ -46,8 +46,14 @@ impl std::fmt::Display for TimeWindow {
 /// - [`SessionWindows`]           — gap-based, merging
 /// - [`GlobalWindows`]            — single window for all elements
 pub trait WindowAssigner<T>: Send + Sync {
+    /// Default trigger type for this assigner.
+    type DefaultTrigger: Trigger<T, TimeWindow> + Clone + Send + 'static;
+
     /// Return the windows that contain the element with the given timestamp.
     fn assign_windows(&self, element: &T, timestamp: EventTime) -> Vec<TimeWindow>;
+
+    /// Create the default trigger for this assigner.
+    fn default_trigger(&self) -> Self::DefaultTrigger;
 
     /// Whether this assigner produces windows that must be merged (Session only).
     fn is_merging(&self) -> bool {
@@ -83,9 +89,15 @@ impl TumblingEventTimeWindows {
 }
 
 impl<T: Send + Sync> WindowAssigner<T> for TumblingEventTimeWindows {
+    type DefaultTrigger = EventTimeTrigger;
+
     fn assign_windows(&self, _element: &T, timestamp: EventTime) -> Vec<TimeWindow> {
         let start = timestamp - (timestamp - self.offset_ms).rem_euclid(self.size_ms);
         vec![TimeWindow::new(start, start + self.size_ms)]
+    }
+
+    fn default_trigger(&self) -> Self::DefaultTrigger {
+        EventTimeTrigger
     }
 }
 
@@ -112,6 +124,8 @@ impl SlidingEventTimeWindows {
 }
 
 impl<T: Send + Sync> WindowAssigner<T> for SlidingEventTimeWindows {
+    type DefaultTrigger = EventTimeTrigger;
+
     fn assign_windows(&self, _element: &T, timestamp: EventTime) -> Vec<TimeWindow> {
         // Mirrors Flink: walk back from last_start by slide until no window covers ts.
         let last_start = timestamp - (timestamp - self.offset_ms).rem_euclid(self.slide_ms);
@@ -122,6 +136,10 @@ impl<T: Send + Sync> WindowAssigner<T> for SlidingEventTimeWindows {
             start -= self.slide_ms;
         }
         windows
+    }
+
+    fn default_trigger(&self) -> Self::DefaultTrigger {
+        EventTimeTrigger
     }
 }
 
@@ -148,8 +166,14 @@ impl SessionWindows {
 }
 
 impl<T: Send + Sync> WindowAssigner<T> for SessionWindows {
+    type DefaultTrigger = EventTimeTrigger;
+
     fn assign_windows(&self, _element: &T, timestamp: EventTime) -> Vec<TimeWindow> {
         vec![TimeWindow::new(timestamp, timestamp + self.gap_ms)]
+    }
+
+    fn default_trigger(&self) -> Self::DefaultTrigger {
+        EventTimeTrigger
     }
 
     fn is_merging(&self) -> bool {
@@ -176,8 +200,14 @@ impl Default for GlobalWindows {
 }
 
 impl<T: Send + Sync> WindowAssigner<T> for GlobalWindows {
+    type DefaultTrigger = EventTimeTrigger;
+
     fn assign_windows(&self, _element: &T, _timestamp: EventTime) -> Vec<TimeWindow> {
         vec![TimeWindow::new(EVENT_TIME_MIN, EVENT_TIME_MAX)]
+    }
+
+    fn default_trigger(&self) -> Self::DefaultTrigger {
+        EventTimeTrigger
     }
 }
 
@@ -213,16 +243,41 @@ impl TriggerResult {
 /// Determines when a window should be evaluated (fired) and when its state
 /// should be discarded (purged).
 ///
-/// Called by `WindowOperator` on two events:
+/// Called by `WindowOperator` on two event-time paths:
 /// - When an element arrives (`on_element`)
-/// - When a watermark advances past a timer registered for a window (`on_watermark`)
+/// - When event time advances (`on_event_time`)
 pub trait Trigger<T, W>: Send {
     /// Called for every element assigned to a window.
     fn on_element(&mut self, element: &T, timestamp: EventTime, window: &W) -> TriggerResult;
 
-    /// Called when the watermark advances.
-    /// The `watermark` argument is the current watermark timestamp.
-    fn on_watermark(&mut self, watermark: EventTime, window: &W) -> TriggerResult;
+    /// Called when event time (watermark) advances.
+    fn on_event_time(&mut self, event_time: EventTime, window: &W) -> TriggerResult;
+
+    /// Called when processing time advances.
+    ///
+    /// Default implementation does nothing.
+    fn on_processing_time(&mut self, _processing_time: EventTime, _window: &W) -> TriggerResult {
+        TriggerResult::Continue
+    }
+
+    /// Backward-compatible alias for old watermark naming.
+    fn on_watermark(&mut self, watermark: EventTime, window: &W) -> TriggerResult {
+        self.on_event_time(watermark, window)
+    }
+}
+
+impl<T, W> Trigger<T, W> for Box<dyn Trigger<T, W>> {
+    fn on_element(&mut self, element: &T, timestamp: EventTime, window: &W) -> TriggerResult {
+        self.as_mut().on_element(element, timestamp, window)
+    }
+
+    fn on_event_time(&mut self, event_time: EventTime, window: &W) -> TriggerResult {
+        self.as_mut().on_event_time(event_time, window)
+    }
+
+    fn on_processing_time(&mut self, processing_time: EventTime, window: &W) -> TriggerResult {
+        self.as_mut().on_processing_time(processing_time, window)
+    }
 }
 
 // ── EventTimeTrigger ──────────────────────────────────────────────────────────
@@ -244,9 +299,36 @@ where
         TriggerResult::Continue
     }
 
-    fn on_watermark(&mut self, watermark: EventTime, window: &W) -> TriggerResult {
+    fn on_event_time(&mut self, event_time: EventTime, window: &W) -> TriggerResult {
         // Fire (and purge) as soon as watermark covers the entire window.
-        if watermark >= window.as_ref().max_timestamp() {
+        if event_time >= window.as_ref().max_timestamp() {
+            TriggerResult::FireAndPurge
+        } else {
+            TriggerResult::Continue
+        }
+    }
+}
+
+/// Processing-time trigger.
+///
+/// Fires when processing time reaches the window max timestamp.
+#[derive(Clone, Default)]
+pub struct ProcessingTimeTrigger;
+
+impl<T: Send, W: Send + Sync> Trigger<T, W> for ProcessingTimeTrigger
+where
+    W: AsRef<TimeWindow>,
+{
+    fn on_element(&mut self, _element: &T, _timestamp: EventTime, _window: &W) -> TriggerResult {
+        TriggerResult::Continue
+    }
+
+    fn on_event_time(&mut self, _event_time: EventTime, _window: &W) -> TriggerResult {
+        TriggerResult::Continue
+    }
+
+    fn on_processing_time(&mut self, processing_time: EventTime, window: &W) -> TriggerResult {
+        if processing_time >= window.as_ref().max_timestamp() {
             TriggerResult::FireAndPurge
         } else {
             TriggerResult::Continue
@@ -330,6 +412,8 @@ where
     /// key_bytes is used as the HashMap key to allow O(1) lookup.
     /// The original key is kept alongside to avoid deserialization.
     buffers: HashMap<(Vec<u8>, TimeWindow), (K, Vec<T>)>,
+    /// Event-time timers used to drive trigger callbacks.
+    timer_service: TimerService,
     current_watermark: EventTime,
     _phantom: PhantomData<OUT>,
 }
@@ -360,9 +444,24 @@ where
             trigger,
             window_fn,
             buffers: HashMap::new(),
+            timer_service: TimerService::new(),
             current_watermark: EVENT_TIME_MIN,
             _phantom: PhantomData,
         }
+    }
+
+    fn register_event_time_timer(&mut self, map_key: &(Vec<u8>, TimeWindow)) -> Result<()> {
+        let timer_key = bincode::serialize(map_key)?;
+        self.timer_service
+            .register(timer_key, map_key.1.max_timestamp());
+        Ok(())
+    }
+
+    fn delete_event_time_timer(&mut self, map_key: &(Vec<u8>, TimeWindow)) -> Result<()> {
+        let timer_key = bincode::serialize(map_key)?;
+        self.timer_service
+            .delete(&timer_key, map_key.1.max_timestamp());
+        Ok(())
     }
 
     fn apply_trigger_result(
@@ -370,7 +469,7 @@ where
         map_key: (Vec<u8>, TimeWindow),
         trigger_result: TriggerResult,
         output: &mut Vec<StreamElement<OUT>>,
-    ) {
+    ) -> Result<()> {
         if trigger_result.is_fire() {
             if let Some((orig_key, elements)) = self.buffers.remove(&map_key) {
                 let mut out_values: Vec<OUT> = Vec::new();
@@ -385,14 +484,41 @@ where
 
                 if !trigger_result.is_purge() {
                     self.buffers.insert(map_key, (orig_key, elements));
+                } else {
+                    self.delete_event_time_timer(&map_key)?;
                 }
             }
-            return;
+            return Ok(());
         }
 
         if trigger_result.is_purge() {
             self.buffers.remove(&map_key);
+            self.delete_event_time_timer(&map_key)?;
         }
+        Ok(())
+    }
+
+    /// Fire due event-time timers at `event_time`.
+    ///
+    /// This is the explicit timer callback path:
+    /// - drains due timers
+    /// - calls `trigger.on_event_time`
+    /// - applies fire/purge and emits window results
+    pub fn on_timer(&mut self, event_time: EventTime) -> Result<Vec<StreamElement<OUT>>> {
+        self.current_watermark = self.current_watermark.max(event_time);
+
+        let mut trigger_results: Vec<((Vec<u8>, TimeWindow), TriggerResult)> = Vec::new();
+        for (timer_key, fire_at) in self.timer_service.drain_due(event_time) {
+            let map_key: (Vec<u8>, TimeWindow) = bincode::deserialize(&timer_key)?;
+            let result = self.trigger.on_event_time(fire_at, &map_key.1);
+            trigger_results.push((map_key, result));
+        }
+
+        let mut output: Vec<StreamElement<OUT>> = Vec::new();
+        for (map_key, trigger_result) in trigger_results {
+            self.apply_trigger_result(map_key, trigger_result, &mut output)?;
+        }
+        Ok(output)
     }
 
     /// Process one stream element and return any window results produced.
@@ -419,31 +545,18 @@ where
                         .or_insert_with(|| (key.clone(), Vec::new()));
                     entry.1.push(rec.value.clone());
 
+                    // Default event-time semantics: register timer at window.max_timestamp().
+                    self.register_event_time_timer(&map_key)?;
+
                     let trigger_result = self.trigger.on_element(&rec.value, ts, &window);
-                    self.apply_trigger_result(map_key, trigger_result, &mut output);
+                    self.apply_trigger_result(map_key, trigger_result, &mut output)?;
                 }
                 Ok(output)
             }
 
             StreamElement::Watermark(wm) => {
                 self.current_watermark = wm.timestamp;
-
-                let trigger_results: Vec<((Vec<u8>, TimeWindow), TriggerResult)> = self
-                    .buffers
-                    .keys()
-                    .map(|map_key| {
-                        (
-                            map_key.clone(),
-                            self.trigger.on_watermark(wm.timestamp, &map_key.1),
-                        )
-                    })
-                    .collect();
-
-                let mut output: Vec<StreamElement<OUT>> = Vec::new();
-
-                for (map_key, trigger_result) in trigger_results {
-                    self.apply_trigger_result(map_key, trigger_result, &mut output);
-                }
+                let mut output = self.on_timer(wm.timestamp)?;
 
                 // Re-emit the watermark downstream so the pipeline keeps advancing.
                 output.push(StreamElement::Watermark(wm));
@@ -454,6 +567,29 @@ where
 
             StreamElement::End => Ok(vec![StreamElement::End]),
         }
+    }
+
+    /// Trigger processing-time callbacks for all active windows.
+    pub fn on_processing_time(
+        &mut self,
+        processing_time: EventTime,
+    ) -> Result<Vec<StreamElement<OUT>>> {
+        let trigger_results: Vec<((Vec<u8>, TimeWindow), TriggerResult)> = self
+            .buffers
+            .keys()
+            .map(|map_key| {
+                (
+                    map_key.clone(),
+                    self.trigger.on_processing_time(processing_time, &map_key.1),
+                )
+            })
+            .collect();
+
+        let mut output: Vec<StreamElement<OUT>> = Vec::new();
+        for (map_key, trigger_result) in trigger_results {
+            self.apply_trigger_result(map_key, trigger_result, &mut output)?;
+        }
+        Ok(output)
     }
 
     /// Return the number of currently buffered (key, window) pairs.
@@ -578,7 +714,7 @@ mod tests {
 
         // Watermark has not yet covered the window's max timestamp (9999ms).
         // Use UFCS to supply T explicitly.
-        let result = <EventTimeTrigger as Trigger<(), TimeWindow>>::on_watermark(
+        let result = <EventTimeTrigger as Trigger<(), TimeWindow>>::on_event_time(
             &mut trigger,
             9_998,
             &window,
@@ -592,7 +728,7 @@ mod tests {
         let window = TimeWindow::new(0, 10_000);
 
         // Watermark equals max_timestamp (9999ms) -> should fire and purge.
-        let result = <EventTimeTrigger as Trigger<(), TimeWindow>>::on_watermark(
+        let result = <EventTimeTrigger as Trigger<(), TimeWindow>>::on_event_time(
             &mut trigger,
             9_999,
             &window,
@@ -606,7 +742,7 @@ mod tests {
         let window = TimeWindow::new(0, 10_000);
 
         // Watermark is beyond max_timestamp.
-        let result = <EventTimeTrigger as Trigger<(), TimeWindow>>::on_watermark(
+        let result = <EventTimeTrigger as Trigger<(), TimeWindow>>::on_event_time(
             &mut trigger,
             20_000,
             &window,
@@ -627,6 +763,26 @@ mod tests {
             &window,
         );
         assert_eq!(result, TriggerResult::Continue);
+    }
+
+    #[test]
+    fn test_processing_time_trigger_fires_at_window_end() {
+        let mut trigger = ProcessingTimeTrigger;
+        let window = TimeWindow::new(0, 10_000);
+
+        let before = <ProcessingTimeTrigger as Trigger<(), TimeWindow>>::on_processing_time(
+            &mut trigger,
+            9_998,
+            &window,
+        );
+        assert_eq!(before, TriggerResult::Continue);
+
+        let at_end = <ProcessingTimeTrigger as Trigger<(), TimeWindow>>::on_processing_time(
+            &mut trigger,
+            9_999,
+            &window,
+        );
+        assert_eq!(at_end, TriggerResult::FireAndPurge);
     }
 
     // ── WindowOperator ────────────────────────────────────────────────────────
@@ -716,6 +872,37 @@ mod tests {
     }
 
     #[test]
+    fn test_window_operator_on_timer_fires_without_forwarding_watermark() {
+        let mut op = make_operator();
+
+        // Three records in [0, 10s) window.
+        for v in [1i32, 2, 3] {
+            op.process(StreamElement::timestamped_record(
+                ("key".to_string(), v),
+                3_000,
+            ))
+            .unwrap();
+        }
+        assert_eq!(op.buffered_window_count(), 1);
+
+        let out = op.on_timer(9_999).unwrap();
+        let records: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamElement::Record(r) => Some(r.value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records, vec![("key".to_string(), 6i32)]);
+        assert!(
+            out.iter()
+                .all(|e| !matches!(e, StreamElement::Watermark(_))),
+            "on_timer should only emit timer-driven outputs"
+        );
+        assert_eq!(op.buffered_window_count(), 0);
+    }
+
+    #[test]
     fn test_window_operator_multiple_keys_separate_windows() {
         let mut op = make_operator();
 
@@ -760,5 +947,45 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], StreamElement::Watermark(_)));
+    }
+
+    #[test]
+    fn test_window_operator_out_of_order_t1_t5_t3_with_watermark6() {
+        // Use 5ms windows so [1, 3] fall into [0, 5) and 5 falls into [5, 10).
+        let mut op = WindowOperator::new(
+            |(k, _): &(String, i32)| k.clone(),
+            |_: &(String, i32)| 0i64,
+            TumblingEventTimeWindows::of(Duration::from_millis(5)),
+            EventTimeTrigger,
+            CountWindowFn,
+        );
+
+        op.process(StreamElement::timestamped_record(("k".to_string(), 1), 1))
+            .unwrap();
+        op.process(StreamElement::timestamped_record(("k".to_string(), 5), 5))
+            .unwrap();
+        op.process(StreamElement::timestamped_record(("k".to_string(), 3), 3))
+            .unwrap();
+
+        let out = op
+            .process(StreamElement::Watermark(crate::types::Watermark::new(6)))
+            .unwrap();
+
+        let records: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamElement::Record(r) => Some(r.value.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Only [0, 5) should fire at watermark=6 => 1 + 3 = 4.
+        assert_eq!(records, vec![("k".to_string(), 4)]);
+        assert_eq!(
+            op.buffered_window_count(),
+            1,
+            "window [5, 10) should still be buffered"
+        );
+        assert!(out.iter().any(|e| matches!(e, StreamElement::Watermark(_))));
     }
 }
