@@ -280,63 +280,105 @@ impl<Head, Tail> Chain<Head, Tail> {
     }
 }
 
+// ============================================================================
+// Built-in Operators: Map, Filter, FlatMap
+// ============================================================================
+
+/// Map operator: transforms each input to output.
+///
+/// Applies a function to each element in the batch.
+pub struct MapOp<F> {
+    f: F,
+}
+
+impl<F> MapOp<F> {
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
+}
+
+impl<F, IN, OUT> Operator<IN> for MapOp<F>
+where
+    F: FnMut(&IN) -> OUT + Send,
+    OUT: Send,
+{
+    type OUT = OUT;
+
+    #[inline]
+    fn process_batch(&mut self, input: &[IN], output: &mut Vec<OUT>) -> Result<()> {
+        output.reserve(input.len());
+        for item in input {
+            output.push((self.f)(item));
+        }
+        Ok(())
+    }
+}
+
+/// Filter operator: selectively passes records.
+///
+/// Only elements that satisfy the predicate are passed through.
+pub struct FilterOp<F> {
+    f: F,
+}
+
+impl<F> FilterOp<F> {
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
+}
+
+impl<F, T> Operator<T> for FilterOp<F>
+where
+    F: FnMut(&T) -> bool + Send,
+    T: Clone + Send,
+{
+    type OUT = T;
+
+    #[inline]
+    fn process_batch(&mut self, input: &[T], output: &mut Vec<T>) -> Result<()> {
+        output.reserve(input.len());
+        for item in input {
+            if (self.f)(item) {
+                output.push(item.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// FlatMap operator: transforms each input to multiple outputs.
+///
+/// Applies a function that returns an iterator, flattening the results.
+pub struct FlatMapOp<F> {
+    f: F,
+}
+
+impl<F> FlatMapOp<F> {
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
+}
+
+impl<F, IN, OUT, I> Operator<IN> for FlatMapOp<F>
+where
+    F: FnMut(&IN) -> I + Send,
+    I: IntoIterator<Item = OUT>,
+    OUT: Send,
+{
+    type OUT = OUT;
+
+    #[inline]
+    fn process_batch(&mut self, input: &[IN], output: &mut Vec<OUT>) -> Result<()> {
+        for item in input {
+            output.extend((self.f)(item));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ========================================================================
-    // Test Operators: Demonstrate Zero-Cost Abstraction
-    // ========================================================================
-
-    /// Map operator: transforms each input to output
-    struct MapOp<F> {
-        f: F,
-    }
-
-    impl<F, IN, OUT> Operator<IN> for MapOp<F>
-    where
-        F: FnMut(&IN) -> OUT + Send,
-        OUT: Send,
-    {
-        type OUT = OUT;
-
-        #[inline]  // Critical: allow LLVM to inline into chain
-        fn process_batch(&mut self, input: &[IN], output: &mut Vec<OUT>) -> Result<()> {
-            output.reserve(input.len());
-            for item in input {
-                output.push((self.f)(item));
-            }
-            Ok(())
-        }
-    }
-
-    /// Filter operator: selectively passes records
-    struct FilterOp<F> {
-        f: F,
-    }
-
-    impl<F, T> Operator<T> for FilterOp<F>
-    where
-        F: FnMut(&T) -> bool + Send,
-        T: Clone + Send,
-    {
-        type OUT = T;  // Filter doesn't change type
-
-        #[inline]  // Critical: allow LLVM to inline into chain
-        fn process_batch(&mut self, input: &[T], output: &mut Vec<T>) -> Result<()> {
-            // Reserve worst-case capacity (all pass)
-            output.reserve(input.len());
-
-            for item in input {
-                if (self.f)(item) {
-                    // Performance note: clone() is expensive for large types
-                    // Future optimization: use selection vector (bitmap) instead
-                    output.push(item.clone());
-                }
-            }
-            Ok(())
-        }
-    }
 
     // ========================================================================
     // Tests: Demonstrate Performance Benefits
@@ -345,8 +387,7 @@ mod tests {
     #[test]
     fn test_single_operator_batch() {
         // Single map operator: x * 2
-        let map = MapOp { f: |x: &i32| x * 2 };
-        let mut chain = chain(map);
+        let mut chain = chain(MapOp::new(|x: &i32| x * 2));
 
         let input = vec![1, 2, 3, 4, 5];
         let mut output = Vec::new();
@@ -359,9 +400,8 @@ mod tests {
     #[test]
     fn test_map_then_filter() {
         // Chain: x * 2 → filter(x > 5)
-        let map = MapOp { f: |x: &i32| x * 2 };
-        let filter = FilterOp { f: |x: &i32| *x > 5 };
-        let mut chain = chain(map).then(filter);
+        let mut chain = chain(MapOp::new(|x: &i32| x * 2))
+            .then(FilterOp::new(|x: &i32| *x > 5));
 
         let input = vec![1, 2, 3, 4, 5];  // → [2, 4, 6, 8, 10] → [6, 8, 10]
         let mut output = Vec::new();
@@ -374,10 +414,9 @@ mod tests {
     #[test]
     fn test_three_operator_chain() {
         // Chain: x * 2 → x + 10 → filter(x > 20)
-        let map1 = MapOp { f: |x: &i32| x * 2 };
-        let map2 = MapOp { f: |x: &i32| x + 10 };
-        let filter = FilterOp { f: |x: &i32| *x > 20 };
-        let mut chain = chain(map1).then(map2).then(filter);
+        let mut chain = chain(MapOp::new(|x: &i32| x * 2))
+            .then(MapOp::new(|x: &i32| x + 10))
+            .then(FilterOp::new(|x: &i32| *x > 20));
 
         let input = vec![1, 5, 10, 15];
         // → [2, 10, 20, 30]

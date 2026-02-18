@@ -8,13 +8,15 @@
 //! use streamcrab_api::environment::StreamExecutionEnvironment;
 //!
 //! let env = StreamExecutionEnvironment::new("wordcount");
-//! env.from_iter(vec!["hello world".to_string(), "hello streamcrab".to_string()])
-//!     .flat_map(|line: String| line.split_whitespace().map(String::from).collect::<Vec<_>>())
-//!     .map(|word: String| (word, 1i32))
-//!     .key_by::<String, _>(|(w, _)| w.clone())
+//! let results = env
+//!     .from_iter(vec!["hello world".to_string(), "hello streamcrab".to_string()])
+//!     .flat_map(|line: &String| {
+//!         line.split_whitespace().map(|w| (w.to_string(), 1i32)).collect::<Vec<_>>()
+//!     })
+//!     .key_by(|(w, _): &(String, i32)| w.clone())
 //!     .reduce(|(w, c1), (_, c2)| (w, c1 + c2))
-//!     .print();
-//! env.execute().unwrap();
+//!     .execute_with_parallelism(2)
+//!     .unwrap();
 //! ```
 //!
 //! - [`environment`] — [`StreamExecutionEnvironment`](environment::StreamExecutionEnvironment):

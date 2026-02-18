@@ -1,31 +1,86 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use streamcrab_core::operator_chain::{Append, ChainEnd, FilterOp, FlatMapOp, MapOp, Operator};
 use streamcrab_core::types::StreamData;
 
-/// A stream of elements of type `T`.
+/// A stream of elements of type `T` with an operator chain of type `OpChain`.
 ///
 /// Created by [`StreamExecutionEnvironment::from_iter`].
-/// Call [`key_by`](Self::key_by) to partition by key.
-pub struct DataStream<T>
+///
+/// The `OpChain` type parameter tracks the chain of transformations applied to the stream.
+/// This enables zero-cost abstraction: all operations are statically dispatched and can be
+/// inlined by LLVM.
+pub struct DataStream<T, OpChain = ChainEnd>
 where
     T: StreamData + Send + 'static,
 {
     pub(crate) source_data: Vec<T>,
+    pub(crate) op_chain: OpChain,
 }
 
-impl<T> DataStream<T>
+impl<T, OpChain> DataStream<T, OpChain>
 where
-    T: StreamData + Send + std::fmt::Debug + 'static,
+    T: StreamData + Send + Clone + 'static,
+    OpChain: Operator<T> + Send + 'static,
+    OpChain::OUT: StreamData + Send + Clone + 'static,
 {
+    /// Apply a transformation to each element.
+    ///
+    /// Uses `Append` to extend the existing operator chain, enabling chaining:
+    /// `stream.map(f1).map(f2)` becomes `Chain<Op1, Chain<Op2, ChainEnd>>`.
+    pub fn map<U, F>(self, f: F) -> DataStream<T, <OpChain as Append<MapOp<F>>>::Result>
+    where
+        U: StreamData + Send + Clone + 'static,
+        F: FnMut(&OpChain::OUT) -> U + Send + 'static,
+        OpChain: Append<MapOp<F>>,
+    {
+        DataStream {
+            source_data: self.source_data,
+            op_chain: self.op_chain.append(MapOp::new(f)),
+        }
+    }
+
+    /// Filter elements based on a predicate.
+    ///
+    /// Uses `Append` to extend the existing operator chain.
+    pub fn filter<F>(self, f: F) -> DataStream<T, <OpChain as Append<FilterOp<F>>>::Result>
+    where
+        F: FnMut(&OpChain::OUT) -> bool + Send + 'static,
+        OpChain::OUT: Clone,
+        OpChain: Append<FilterOp<F>>,
+    {
+        DataStream {
+            source_data: self.source_data,
+            op_chain: self.op_chain.append(FilterOp::new(f)),
+        }
+    }
+
+    /// Transform each element into multiple elements.
+    ///
+    /// Uses `Append` to extend the existing operator chain.
+    pub fn flat_map<U, I, F>(self, f: F) -> DataStream<T, <OpChain as Append<FlatMapOp<F>>>::Result>
+    where
+        U: StreamData + Send + Clone + 'static,
+        I: IntoIterator<Item = U>,
+        F: FnMut(&OpChain::OUT) -> I + Send + 'static,
+        OpChain: Append<FlatMapOp<F>>,
+    {
+        DataStream {
+            source_data: self.source_data,
+            op_chain: self.op_chain.append(FlatMapOp::new(f)),
+        }
+    }
+
     /// Partition the stream by key, returning a [`KeyedStream`].
-    pub fn key_by<K, F>(self, key_fn: F) -> KeyedStream<K, T, F>
+    pub fn key_by<K, F>(self, key_fn: F) -> KeyedStream<K, T, OpChain, F>
     where
         K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
-        F: Fn(&T) -> K + Send + Sync + Clone + 'static,
+        F: Fn(&OpChain::OUT) -> K + Send + Sync + Clone + 'static,
     {
         KeyedStream {
             source_data: self.source_data,
+            op_chain: self.op_chain,
             key_fn,
             _phantom: PhantomData,
         }
@@ -36,33 +91,36 @@ where
 ///
 /// Created by calling [`DataStream::key_by`]. Elements with the same key are
 /// grouped together for aggregation.
-pub struct KeyedStream<K, T, KeyFn>
+pub struct KeyedStream<K, T, OpChain, KeyFn>
 where
     K: StreamData + Send + 'static,
     T: StreamData + Send + 'static,
-    KeyFn: Fn(&T) -> K + Send + 'static,
 {
     pub(crate) source_data: Vec<T>,
+    pub(crate) op_chain: OpChain,
     pub(crate) key_fn: KeyFn,
     pub(crate) _phantom: PhantomData<K>,
 }
 
-impl<K, T, KeyFn> KeyedStream<K, T, KeyFn>
+impl<K, T, OpChain, KeyFn> KeyedStream<K, T, OpChain, KeyFn>
 where
     K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
-    T: StreamData + Send + std::fmt::Debug + 'static,
-    KeyFn: Fn(&T) -> K + Send + Sync + Clone + 'static,
+    T: StreamData + Send + Clone + 'static,
+    OpChain: Operator<T> + Send + 'static,
+    OpChain::OUT: StreamData + Send + Clone + 'static,
+    KeyFn: Fn(&OpChain::OUT) -> K + Send + Sync + Clone + 'static,
 {
     /// Reduce elements with the same key by repeatedly applying `reduce_fn` to the
     /// accumulated value and each new element.
     ///
     /// Returns a [`ReduceJob`] that can be executed with [`execute_with_parallelism`](ReduceJob::execute_with_parallelism).
-    pub fn reduce<ReduceFn>(self, reduce_fn: ReduceFn) -> ReduceJob<K, T, KeyFn, ReduceFn>
+    pub fn reduce<ReduceFn>(self, reduce_fn: ReduceFn) -> ReduceJob<K, T, OpChain, KeyFn, ReduceFn>
     where
-        ReduceFn: Fn(T, T) -> T + Send + Sync + Clone + 'static,
+        ReduceFn: Fn(OpChain::OUT, OpChain::OUT) -> OpChain::OUT + Send + Sync + Clone + 'static,
     {
         ReduceJob {
             source_data: self.source_data,
+            op_chain: self.op_chain,
             key_fn: self.key_fn,
             reduce_fn,
             _phantom: PhantomData,
@@ -74,25 +132,26 @@ where
 ///
 /// Created by calling [`KeyedStream::reduce`].
 /// Execute with [`execute_with_parallelism`](Self::execute_with_parallelism).
-pub struct ReduceJob<K, T, KeyFn, ReduceFn>
+pub struct ReduceJob<K, T, OpChain, KeyFn, ReduceFn>
 where
     K: StreamData + Send + 'static,
     T: StreamData + Send + 'static,
-    KeyFn: Fn(&T) -> K + Send + 'static,
-    ReduceFn: Fn(T, T) -> T + Send + 'static,
 {
     pub(crate) source_data: Vec<T>,
+    pub(crate) op_chain: OpChain,
     pub(crate) key_fn: KeyFn,
     pub(crate) reduce_fn: ReduceFn,
     pub(crate) _phantom: PhantomData<K>,
 }
 
-impl<K, T, KeyFn, ReduceFn> ReduceJob<K, T, KeyFn, ReduceFn>
+impl<K, T, OpChain, KeyFn, ReduceFn> ReduceJob<K, T, OpChain, KeyFn, ReduceFn>
 where
     K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
     T: StreamData + Send + std::fmt::Debug + Clone + 'static,
-    KeyFn: Fn(&T) -> K + Send + Sync + Clone + 'static,
-    ReduceFn: Fn(T, T) -> T + Send + Sync + Clone + 'static,
+    OpChain: Operator<T> + Send + 'static,
+    OpChain::OUT: StreamData + Send + std::fmt::Debug + Clone + 'static,
+    KeyFn: Fn(&OpChain::OUT) -> K + Send + Sync + Clone + 'static,
+    ReduceFn: Fn(OpChain::OUT, OpChain::OUT) -> OpChain::OUT + Send + Sync + Clone + 'static,
 {
     /// Execute the job with the specified parallelism.
     ///
@@ -103,7 +162,7 @@ where
     /// Creates a pipeline:
     /// ```text
     /// Source Task (1 thread)
-    ///     |
+    ///     | Apply OpChain
     ///     | Hash Partition (by key)
     ///     v
     /// Reduce Tasks (parallelism threads)
@@ -112,9 +171,9 @@ where
     /// Collector Task (1 thread)
     /// ```
     pub fn execute_with_parallelism(
-        self,
+        mut self,
         parallelism: usize,
-    ) -> anyhow::Result<Arc<Mutex<std::collections::HashMap<K, T>>>> {
+    ) -> anyhow::Result<Arc<Mutex<std::collections::HashMap<K, OpChain::OUT>>>> {
         use std::thread;
         use streamcrab_core::channel::local_channel;
         use streamcrab_core::operator_chain::Operator;
@@ -126,6 +185,10 @@ where
         let buffer_size = 1024;
         let results = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let results_clone = Arc::clone(&results);
+
+        // Step 1: Apply operator chain to transform source data
+        let mut transformed_data = Vec::new();
+        self.op_chain.process_batch(&self.source_data, &mut transformed_data)?;
 
         // Create channels: Source -> Reduce Tasks
         let mut source_to_reduce_channels = Vec::new();
@@ -150,13 +213,12 @@ where
             .map(|(_, receiver)| receiver)
             .collect();
 
-        let source_data = self.source_data;
         let key_fn = self.key_fn.clone();
 
         let source_handle = thread::spawn(move || -> anyhow::Result<()> {
             let partitioner = HashPartitioner::new(key_fn.clone());
 
-            for item in source_data {
+            for item in transformed_data {
                 // Determine target partition
                 let partition = partitioner.partition(&item, parallelism);
 
@@ -260,7 +322,7 @@ where
                     match receiver.try_recv() {
                         Ok(Some(element)) => match element {
                             StreamElement::Record(record) => {
-                                let (key, value): (K, T) = record.value;
+                                let (key, value) = record.value;
                                 results_clone.lock().unwrap().insert(key, value);
                             }
                             StreamElement::End => {

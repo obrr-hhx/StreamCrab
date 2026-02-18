@@ -22,7 +22,11 @@ impl StreamExecutionEnvironment {
         T: StreamData + std::fmt::Debug + Send + 'static,
         I: IntoIterator<Item = T> + 'static,
     {
+        use streamcrab_core::operator_chain::ChainEnd;
         let source_data: Vec<T> = iter.into_iter().collect();
-        DataStream { source_data }
+        DataStream {
+            source_data,
+            op_chain: ChainEnd,
+        }
     }
 }
