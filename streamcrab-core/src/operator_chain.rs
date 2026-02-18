@@ -75,6 +75,7 @@
 
 use crate::types::EventTime;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Core Operator Trait: Batch + Push-based + Associated Type
@@ -116,6 +117,20 @@ pub trait Operator<IN>: Send {
     ///
     /// The output buffer is reused across batches (caller clears it).
     fn process_batch(&mut self, input: &[IN], output: &mut Vec<Self::OUT>) -> Result<()>;
+
+    /// Snapshot operator state into bytes.
+    ///
+    /// Stateless operators can keep the default empty snapshot.
+    fn snapshot_state(&self) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    /// Restore operator state from bytes.
+    ///
+    /// Stateless operators can keep the default no-op implementation.
+    fn restore_state(&mut self, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
 
     /// Unified timer callback.
     ///
@@ -192,6 +207,12 @@ pub struct ChainEnd;
 pub struct Chain<Head, Tail> {
     head: Head,
     tail: Tail,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChainSnapshot {
+    head: Vec<u8>,
+    tail: Vec<u8>,
 }
 
 impl<Head, Tail> Chain<Head, Tail> {
@@ -303,6 +324,24 @@ where
         output: &mut Vec<Self::OUT>,
     ) -> Result<()> {
         self.on_timer(processing_time, TimerDomain::ProcessingTime, output)
+    }
+
+    fn snapshot_state(&self) -> Result<Vec<u8>> {
+        let snapshot = ChainSnapshot {
+            head: self.head.snapshot_state()?,
+            tail: self.tail.snapshot_state()?,
+        };
+        Ok(bincode::serialize(&snapshot)?)
+    }
+
+    fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let snapshot: ChainSnapshot = bincode::deserialize(data)?;
+        self.head.restore_state(&snapshot.head)?;
+        self.tail.restore_state(&snapshot.tail)?;
+        Ok(())
     }
 }
 
@@ -624,5 +663,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, vec![7, 99]);
+    }
+
+    struct CountingStatefulOp {
+        count: i32,
+    }
+
+    impl Operator<i32> for CountingStatefulOp {
+        type OUT = i32;
+
+        fn process_batch(&mut self, input: &[i32], output: &mut Vec<i32>) -> Result<()> {
+            output.reserve(input.len());
+            for v in input {
+                output.push(*v + self.count);
+                self.count += 1;
+            }
+            Ok(())
+        }
+
+        fn snapshot_state(&self) -> Result<Vec<u8>> {
+            Ok(bincode::serialize(&self.count)?)
+        }
+
+        fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+            self.count = bincode::deserialize(data)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_chain_snapshot_restore_roundtrip() {
+        let mut op_chain = chain(CountingStatefulOp { count: 0 }).then(MapOp::new(|x: &i32| x * 2));
+        let mut output = Vec::new();
+        op_chain.process_batch(&[1, 2], &mut output).unwrap();
+        assert_eq!(output, vec![2, 6]);
+
+        let snapshot = op_chain.snapshot_state().unwrap();
+
+        let mut restored_chain =
+            chain(CountingStatefulOp { count: 0 }).then(MapOp::new(|x: &i32| x * 2));
+        restored_chain.restore_state(&snapshot).unwrap();
+
+        let mut restored_output = Vec::new();
+        restored_chain
+            .process_batch(&[3], &mut restored_output)
+            .unwrap();
+        assert_eq!(restored_output, vec![10]);
     }
 }

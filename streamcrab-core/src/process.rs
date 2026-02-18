@@ -267,6 +267,14 @@ where
 
         Ok(())
     }
+
+    fn snapshot_state(&self) -> Result<Vec<u8>> {
+        self.state_backend.snapshot()
+    }
+
+    fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        self.state_backend.restore(data)
+    }
 }
 
 // ============================================================================
@@ -323,6 +331,16 @@ where
             _phantom: std::marker::PhantomData,
         }
     }
+
+    /// Snapshot keyed reduce state.
+    pub fn snapshot_state(&self) -> Result<Vec<u8>> {
+        self.state_backend.snapshot()
+    }
+
+    /// Restore keyed reduce state from snapshot bytes.
+    pub fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        self.state_backend.restore(data)
+    }
 }
 
 impl<K, T, F, B> Operator<(K, T)> for ReduceOperator<K, T, F, B>
@@ -370,6 +388,14 @@ where
         }
 
         Ok(())
+    }
+
+    fn snapshot_state(&self) -> Result<Vec<u8>> {
+        ReduceOperator::snapshot_state(self)
+    }
+
+    fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        ReduceOperator::restore_state(self, data)
     }
 }
 
@@ -665,5 +691,57 @@ mod tests {
         assert_eq!(output[1], ("user_1".to_string(), 30));
         assert_eq!(output[2], ("user_1".to_string(), 30)); // Max stays 30
         assert_eq!(output[3], ("user_1".to_string(), 50));
+    }
+
+    #[test]
+    fn test_process_operator_snapshot_restore() {
+        let aggregator = CountAggregator::new();
+        let backend = HashMapStateBackend::new();
+        let mut operator = ProcessOperator::new(aggregator, backend);
+
+        let mut output = Vec::new();
+        operator
+            .process_batch(&[("user_1".to_string(), 10)], &mut output)
+            .unwrap();
+        assert_eq!(output, vec![("user_1".to_string(), 1)]);
+
+        let snapshot = operator.snapshot_state().unwrap();
+
+        let aggregator = CountAggregator::new();
+        let backend = HashMapStateBackend::new();
+        let mut restored = ProcessOperator::new(aggregator, backend);
+        restored.restore_state(&snapshot).unwrap();
+
+        let mut out_after_restore = Vec::new();
+        restored
+            .process_batch(&[("user_1".to_string(), 20)], &mut out_after_restore)
+            .unwrap();
+        assert_eq!(out_after_restore, vec![("user_1".to_string(), 2)]);
+    }
+
+    #[test]
+    fn test_reduce_operator_snapshot_restore() {
+        let reducer = SumReducer;
+        let backend = HashMapStateBackend::new();
+        let mut operator = ReduceOperator::new(reducer, backend);
+
+        let mut output = Vec::new();
+        operator
+            .process_batch(&[("user_1".to_string(), 10)], &mut output)
+            .unwrap();
+        assert_eq!(output, vec![("user_1".to_string(), 10)]);
+
+        let snapshot = operator.snapshot_state().unwrap();
+
+        let reducer = SumReducer;
+        let backend = HashMapStateBackend::new();
+        let mut restored = ReduceOperator::new(reducer, backend);
+        restored.restore_state(&snapshot).unwrap();
+
+        let mut out_after_restore = Vec::new();
+        restored
+            .process_batch(&[("user_1".to_string(), 20)], &mut out_after_restore)
+            .unwrap();
+        assert_eq!(out_after_restore, vec![("user_1".to_string(), 30)]);
     }
 }

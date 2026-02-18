@@ -255,6 +255,7 @@ impl WatermarkTracker {
 /// # Invariant
 /// A `(key_bytes, fire_at)` pair is registered at most once; re-registering
 /// the same pair is idempotent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TimerService {
     /// Sorted map: fire_at -> set of serialized key bytes registered at that time.
     timers: BTreeMap<EventTime, BTreeSet<Vec<u8>>>,

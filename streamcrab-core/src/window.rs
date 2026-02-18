@@ -418,6 +418,13 @@ where
     _phantom: PhantomData<OUT>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WindowOperatorSnapshot<K, T> {
+    buffered_entries: Vec<(Vec<u8>, TimeWindow, K, Vec<T>)>,
+    timer_service: TimerService,
+    current_watermark: EventTime,
+}
+
 impl<K, T, OUT, KF, TF, WA, TR, WFN> WindowOperator<K, T, OUT, KF, TF, WA, TR, WFN>
 where
     K: StreamData,
@@ -448,6 +455,48 @@ where
             current_watermark: EVENT_TIME_MIN,
             _phantom: PhantomData,
         }
+    }
+
+    /// Snapshot buffered window state and timers.
+    pub fn snapshot_state(&self) -> Result<Vec<u8>> {
+        let buffered_entries = self
+            .buffers
+            .iter()
+            .map(|((key_bytes, window), (key, elements))| {
+                (
+                    key_bytes.clone(),
+                    window.clone(),
+                    key.clone(),
+                    elements.clone(),
+                )
+            })
+            .collect();
+
+        let snapshot = WindowOperatorSnapshot {
+            buffered_entries,
+            timer_service: self.timer_service.clone(),
+            current_watermark: self.current_watermark,
+        };
+        Ok(bincode::serialize(&snapshot)?)
+    }
+
+    /// Restore buffered window state and timers.
+    pub fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            self.buffers.clear();
+            self.timer_service = TimerService::new();
+            self.current_watermark = EVENT_TIME_MIN;
+            return Ok(());
+        }
+
+        let snapshot: WindowOperatorSnapshot<K, T> = bincode::deserialize(data)?;
+        self.buffers.clear();
+        for (key_bytes, window, key, elements) in snapshot.buffered_entries {
+            self.buffers.insert((key_bytes, window), (key, elements));
+        }
+        self.timer_service = snapshot.timer_service;
+        self.current_watermark = snapshot.current_watermark;
+        Ok(())
     }
 
     fn register_event_time_timer(&mut self, map_key: &(Vec<u8>, TimeWindow)) -> Result<()> {
@@ -987,5 +1036,42 @@ mod tests {
             "window [5, 10) should still be buffered"
         );
         assert!(out.iter().any(|e| matches!(e, StreamElement::Watermark(_))));
+    }
+
+    #[test]
+    fn test_window_operator_snapshot_restore() {
+        let mut op = make_operator();
+
+        op.process(StreamElement::timestamped_record(
+            ("key".to_string(), 1i32),
+            1_000,
+        ))
+        .unwrap();
+        op.process(StreamElement::timestamped_record(
+            ("key".to_string(), 2i32),
+            2_000,
+        ))
+        .unwrap();
+        assert_eq!(op.buffered_window_count(), 1);
+
+        let snapshot = op.snapshot_state().unwrap();
+
+        let mut restored = make_operator();
+        restored.restore_state(&snapshot).unwrap();
+        assert_eq!(restored.buffered_window_count(), 1);
+
+        let out = restored
+            .process(StreamElement::Watermark(crate::types::Watermark::new(
+                9_999,
+            )))
+            .unwrap();
+        let records: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamElement::Record(r) => Some(r.value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records, vec![("key".to_string(), 3)]);
     }
 }

@@ -18,6 +18,7 @@
 //! - [`process`] — Keyed process functions: [`KeyedProcessFunction`](process::KeyedProcessFunction).
 
 pub mod channel;
+pub mod checkpoint;
 pub mod graph;
 pub mod input_gate;
 pub mod job_graph;

@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+use std::time::Duration;
 use streamcrab_api::environment::StreamExecutionEnvironment;
 
 #[test]
@@ -66,6 +68,40 @@ fn test_keyed_sum() {
     assert_eq!(final_sums.get("user_2"), Some(&("user_2".to_string(), 45)));
     assert_eq!(final_sums.get("user_3"), Some(&("user_3".to_string(), 30)));
     assert_eq!(final_sums.len(), 3);
+}
+
+#[test]
+fn test_keyed_sum_with_manual_checkpoints_parallel() {
+    let env = StreamExecutionEnvironment::new("keyed-sum-checkpointed");
+
+    let transactions = vec![
+        ("user_1".to_string(), 10i32),
+        ("user_2".to_string(), 20),
+        ("user_1".to_string(), 15),
+        ("user_3".to_string(), 30),
+        ("user_2".to_string(), 25),
+        ("user_1".to_string(), 5),
+    ];
+
+    let baseline = env
+        .from_iter(transactions.clone())
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism(2)
+        .unwrap();
+
+    let checkpointed = env
+        .from_iter(transactions)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism_and_checkpoints(2, &[0, 3, 6])
+        .unwrap();
+
+    let baseline_map = baseline.lock().unwrap().clone();
+    let checkpointed_map = checkpointed.result.lock().unwrap().clone();
+
+    assert_eq!(baseline_map, checkpointed_map);
+    assert_eq!(checkpointed.completed_checkpoints, vec![1, 2, 3]);
 }
 
 /// WordCount using flat_map to tokenize lines, then reduce to count words.
@@ -192,4 +228,157 @@ fn test_map_filter_chain() {
     assert_eq!(final_results.get(&1), None);
     assert_eq!(final_results.get(&5), None);
     assert_eq!(final_results.len(), 5);
+}
+
+fn lcg_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    *state
+}
+
+fn gen_transactions(seed: u64, n: usize, num_keys: u32) -> Vec<(u32, i64)> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = (lcg_next(&mut state) % num_keys as u64) as u32;
+        let val = ((lcg_next(&mut state) % 9) + 1) as i64;
+        out.push((key, val));
+    }
+    out
+}
+
+#[test]
+fn test_keyed_sum_with_unsorted_duplicated_checkpoint_points() {
+    let env = StreamExecutionEnvironment::new("keyed-sum-checkpoint-points");
+    let transactions = vec![
+        ("user_1".to_string(), 10i32),
+        ("user_2".to_string(), 20),
+        ("user_1".to_string(), 15),
+        ("user_3".to_string(), 30),
+        ("user_2".to_string(), 25),
+        ("user_1".to_string(), 5),
+    ];
+
+    let checkpointed = env
+        .from_iter(transactions)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism_and_checkpoints(2, &[6, 0, 3, 3, 6])
+        .unwrap();
+
+    assert_eq!(
+        checkpointed.completed_checkpoints,
+        vec![1, 2, 3],
+        "checkpoint points should be sorted and deduplicated internally"
+    );
+}
+
+#[test]
+fn test_keyed_sum_checkpoint_invalid_trigger_position_returns_error() {
+    let env = StreamExecutionEnvironment::new("keyed-sum-checkpoint-invalid-pos");
+    let transactions = vec![
+        ("user_1".to_string(), 10i32),
+        ("user_2".to_string(), 20),
+        ("user_3".to_string(), 30),
+    ];
+
+    let err = match env
+        .from_iter(transactions)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism_and_checkpoints(2, &[4])
+    {
+        Ok(_) => panic!("expected invalid trigger position to return error"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("exceeds record count"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_keyed_sum_checkpoint_zero_parallelism_returns_error() {
+    let env = StreamExecutionEnvironment::new("keyed-sum-checkpoint-zero-parallelism");
+    let transactions = vec![("user_1".to_string(), 10i32)];
+
+    let err = match env
+        .from_iter(transactions)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism_and_checkpoints(0, &[0])
+    {
+        Ok(_) => panic!("expected parallelism=0 to return error"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("parallelism must be greater than 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_reduce_checkpoint_high_frequency_completes_within_timeout() {
+    let data: Vec<(u32, i64)> = (0..200usize)
+        .map(|i| ((i % 23) as u32, (i % 7) as i64 + 1))
+        .collect();
+    let mut barrier_points: Vec<usize> = (0..=data.len()).step_by(20).collect();
+    if *barrier_points.last().unwrap() != data.len() {
+        barrier_points.push(data.len());
+    }
+
+    let expected_checkpoint_count = barrier_points.len();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let env = StreamExecutionEnvironment::new("reduce-checkpoint-high-frequency");
+        let result = env
+            .from_iter(data)
+            .key_by(|(user, _): &(u32, i64)| *user)
+            .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+            .execute_with_parallelism_and_checkpoints(4, &barrier_points)
+            .map(|r| r.completed_checkpoints.len());
+        let _ = tx.send(result);
+    });
+
+    let completed = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("checkpointed reduce job should complete within timeout")
+        .expect("checkpointed reduce job should succeed");
+    assert_eq!(completed, expected_checkpoint_count);
+}
+
+#[test]
+fn test_reduce_checkpoint_deterministic_fuzz_matches_baseline() {
+    for seed in [1_u64, 7_u64, 42_u64] {
+        let data = gen_transactions(seed, 300, 17);
+        let barrier_points = vec![0usize, 50, 150, 300];
+
+        let env = StreamExecutionEnvironment::new("reduce-checkpoint-fuzz-baseline");
+        let baseline = env
+            .from_iter(data.clone())
+            .key_by(|(k, _): &(u32, i64)| *k)
+            .reduce(|(k1, v1), (_, v2)| (k1, v1 + v2))
+            .execute_with_parallelism(4)
+            .unwrap();
+
+        let checkpointed = env
+            .from_iter(data)
+            .key_by(|(k, _): &(u32, i64)| *k)
+            .reduce(|(k1, v1), (_, v2)| (k1, v1 + v2))
+            .execute_with_parallelism_and_checkpoints(4, &barrier_points)
+            .unwrap();
+
+        assert_eq!(
+            baseline.lock().unwrap().clone(),
+            checkpointed.result.lock().unwrap().clone(),
+            "seed={seed}: checkpointed result diverged from baseline"
+        );
+        assert_eq!(
+            checkpointed.completed_checkpoints.len(),
+            barrier_points.len(),
+            "seed={seed}: checkpoint completion count mismatch"
+        );
+    }
 }

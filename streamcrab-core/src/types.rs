@@ -57,12 +57,24 @@ impl std::fmt::Display for Watermark {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Barrier {
     pub checkpoint_id: CheckpointId,
+    pub timestamp: EventTime,
 }
 
 impl Barrier {
     /// Create a new checkpoint barrier with the given ID.
     pub fn new(checkpoint_id: CheckpointId) -> Self {
-        Self { checkpoint_id }
+        Self {
+            checkpoint_id,
+            timestamp: 0,
+        }
+    }
+
+    /// Create a new checkpoint barrier with explicit timestamp.
+    pub fn with_timestamp(checkpoint_id: CheckpointId, timestamp: EventTime) -> Self {
+        Self {
+            checkpoint_id,
+            timestamp,
+        }
     }
 }
 
@@ -99,6 +111,11 @@ impl<T> StreamElement<T> {
     /// Create a checkpoint barrier element.
     pub fn barrier(checkpoint_id: CheckpointId) -> Self {
         Self::CheckpointBarrier(Barrier::new(checkpoint_id))
+    }
+
+    /// Create a checkpoint barrier element with explicit timestamp.
+    pub fn barrier_with_timestamp(checkpoint_id: CheckpointId, timestamp: EventTime) -> Self {
+        Self::CheckpointBarrier(Barrier::with_timestamp(checkpoint_id, timestamp))
     }
 }
 
@@ -195,7 +212,22 @@ mod tests {
     fn test_stream_element_barrier() {
         let elem = StreamElement::<i32>::barrier(5);
         match elem {
-            StreamElement::CheckpointBarrier(b) => assert_eq!(b.checkpoint_id, 5),
+            StreamElement::CheckpointBarrier(b) => {
+                assert_eq!(b.checkpoint_id, 5);
+                assert_eq!(b.timestamp, 0);
+            }
+            _ => panic!("expected Barrier"),
+        }
+    }
+
+    #[test]
+    fn test_stream_element_barrier_with_timestamp() {
+        let elem = StreamElement::<i32>::barrier_with_timestamp(7, 1234);
+        match elem {
+            StreamElement::CheckpointBarrier(b) => {
+                assert_eq!(b.checkpoint_id, 7);
+                assert_eq!(b.timestamp, 1234);
+            }
             _ => panic!("expected Barrier"),
         }
     }

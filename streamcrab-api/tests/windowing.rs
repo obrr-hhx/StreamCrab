@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::{sync::mpsc, thread};
 
 use streamcrab_api::environment::StreamExecutionEnvironment;
 use streamcrab_core::time::BoundedOutOfOrderness;
@@ -12,6 +13,58 @@ struct Event {
     user: String,
     ts: i64,
     value: i32,
+}
+
+#[derive(Clone)]
+struct FireOnThirdProcessingTickOnce {
+    ticks: usize,
+    fired: bool,
+}
+
+impl Trigger<Event, TimeWindow> for FireOnThirdProcessingTickOnce {
+    fn on_element(
+        &mut self,
+        _element: &Event,
+        _timestamp: i64,
+        _window: &TimeWindow,
+    ) -> TriggerResult {
+        TriggerResult::Continue
+    }
+
+    fn on_event_time(&mut self, _event_time: i64, _window: &TimeWindow) -> TriggerResult {
+        TriggerResult::Continue
+    }
+
+    fn on_processing_time(&mut self, _processing_time: i64, _window: &TimeWindow) -> TriggerResult {
+        if self.fired {
+            return TriggerResult::Continue;
+        }
+        self.ticks += 1;
+        if self.ticks == 3 {
+            self.fired = true;
+            TriggerResult::FireAndPurge
+        } else {
+            TriggerResult::Continue
+        }
+    }
+}
+
+fn lcg_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    *state
+}
+
+fn gen_events(seed: u64, n: usize, num_users: usize) -> Vec<Event> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let user = format!("u{}", (lcg_next(&mut state) as usize % num_users) + 1);
+        let jitter = (lcg_next(&mut state) as i64 % 1500) - 500; // [-500, 999]
+        let ts = ((i as i64) * 1000 + jitter).max(0);
+        let value = (lcg_next(&mut state) % 7) as i32 + 1;
+        out.push(Event { user, ts, value });
+    }
+    out
 }
 
 #[test]
@@ -425,6 +478,347 @@ fn test_window_execute_with_parallelism_matches_single_thread() {
     parallel_norm.sort();
 
     assert_eq!(single_norm, parallel_norm);
+}
+
+#[test]
+fn test_window_parallel_with_manual_checkpoints() {
+    let env = StreamExecutionEnvironment::new("window-parallel-checkpointed");
+    let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+
+    let events = vec![
+        Event {
+            user: "u1".to_string(),
+            ts: 1_000,
+            value: 1,
+        },
+        Event {
+            user: "u2".to_string(),
+            ts: 2_000,
+            value: 2,
+        },
+        Event {
+            user: "u1".to_string(),
+            ts: 9_000,
+            value: 3,
+        },
+        Event {
+            user: "u2".to_string(),
+            ts: 11_000,
+            value: 4,
+        },
+        Event {
+            user: "u1".to_string(),
+            ts: 12_000,
+            value: 5,
+        },
+        Event {
+            user: "u2".to_string(),
+            ts: 18_000,
+            value: 6,
+        },
+    ];
+
+    let baseline = env
+        .from_iter(events.clone())
+        .assign_timestamps_and_watermarks(strategy)
+        .key_by(|e: &Event| e.user.clone())
+        .window(TumblingEventTimeWindows::of(Duration::from_secs(10)))
+        .reduce(|a, b| Event {
+            user: a.user.clone(),
+            ts: a.ts.max(b.ts),
+            value: a.value + b.value,
+        })
+        .execute_with_parallelism(2)
+        .unwrap();
+
+    let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+    let checkpointed = env
+        .from_iter(events)
+        .assign_timestamps_and_watermarks(strategy)
+        .key_by(|e: &Event| e.user.clone())
+        .window(TumblingEventTimeWindows::of(Duration::from_secs(10)))
+        .reduce(|a, b| Event {
+            user: a.user.clone(),
+            ts: a.ts.max(b.ts),
+            value: a.value + b.value,
+        })
+        .execute_with_parallelism_and_checkpoints(2, &[0, 3, 6])
+        .unwrap();
+
+    let mut baseline_norm: Vec<(i64, String, i32)> = baseline
+        .into_iter()
+        .map(|r| (r.timestamp.unwrap(), r.value.0, r.value.1.value))
+        .collect();
+    baseline_norm.sort();
+
+    let mut checkpointed_norm: Vec<(i64, String, i32)> = checkpointed
+        .result
+        .into_iter()
+        .map(|r| (r.timestamp.unwrap(), r.value.0, r.value.1.value))
+        .collect();
+    checkpointed_norm.sort();
+
+    assert_eq!(baseline_norm, checkpointed_norm);
+    assert_eq!(checkpointed.completed_checkpoints, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_window_checkpoint_points_unsorted_and_duplicated() {
+    let env = StreamExecutionEnvironment::new("window-checkpoint-points");
+    let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+    let events = vec![
+        Event {
+            user: "u1".to_string(),
+            ts: 1_000,
+            value: 1,
+        },
+        Event {
+            user: "u2".to_string(),
+            ts: 2_000,
+            value: 2,
+        },
+        Event {
+            user: "u1".to_string(),
+            ts: 9_000,
+            value: 3,
+        },
+        Event {
+            user: "u2".to_string(),
+            ts: 11_000,
+            value: 4,
+        },
+        Event {
+            user: "u1".to_string(),
+            ts: 12_000,
+            value: 5,
+        },
+        Event {
+            user: "u2".to_string(),
+            ts: 18_000,
+            value: 6,
+        },
+    ];
+
+    let out = env
+        .from_iter(events)
+        .assign_timestamps_and_watermarks(strategy)
+        .key_by(|e: &Event| e.user.clone())
+        .window(TumblingEventTimeWindows::of(Duration::from_secs(10)))
+        .reduce(|a, b| Event {
+            user: a.user.clone(),
+            ts: a.ts.max(b.ts),
+            value: a.value + b.value,
+        })
+        .execute_with_parallelism_and_checkpoints(2, &[6, 0, 3, 6, 3])
+        .unwrap();
+
+    assert_eq!(out.completed_checkpoints, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_window_checkpoint_invalid_trigger_position_returns_error() {
+    let env = StreamExecutionEnvironment::new("window-checkpoint-invalid-position");
+    let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+    let events = vec![
+        Event {
+            user: "u1".to_string(),
+            ts: 1_000,
+            value: 1,
+        },
+        Event {
+            user: "u1".to_string(),
+            ts: 2_000,
+            value: 2,
+        },
+    ];
+
+    let err = match env
+        .from_iter(events)
+        .assign_timestamps_and_watermarks(strategy)
+        .key_by(|e: &Event| e.user.clone())
+        .window(TumblingEventTimeWindows::of(Duration::from_secs(10)))
+        .reduce(|a, b| Event {
+            user: a.user.clone(),
+            ts: a.ts.max(b.ts),
+            value: a.value + b.value,
+        })
+        .execute_with_parallelism_and_checkpoints(2, &[3])
+    {
+        Ok(_) => panic!("expected invalid trigger position to return error"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("exceeds record count"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_window_checkpoint_zero_parallelism_returns_error() {
+    let env = StreamExecutionEnvironment::new("window-checkpoint-zero-parallelism");
+    let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+    let events = vec![Event {
+        user: "u1".to_string(),
+        ts: 1_000,
+        value: 1,
+    }];
+
+    let err = match env
+        .from_iter(events)
+        .assign_timestamps_and_watermarks(strategy)
+        .key_by(|e: &Event| e.user.clone())
+        .window(TumblingEventTimeWindows::of(Duration::from_secs(10)))
+        .reduce(|a, b| Event {
+            user: a.user.clone(),
+            ts: a.ts.max(b.ts),
+            value: a.value + b.value,
+        })
+        .execute_with_parallelism_and_checkpoints(0, &[0])
+    {
+        Ok(_) => panic!("expected parallelism=0 to return error"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("parallelism must be greater than 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_window_checkpoint_barrier_branch_runs_processing_time_tick() {
+    let env = StreamExecutionEnvironment::new("window-checkpoint-barrier-processing-tick");
+    let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+    let events = vec![
+        Event {
+            user: "u1".to_string(),
+            ts: 1_000,
+            value: 1,
+        },
+        Event {
+            user: "u1".to_string(),
+            ts: 2_000,
+            value: 2,
+        },
+    ];
+
+    let out = env
+        .from_iter(events)
+        .assign_timestamps_and_watermarks(strategy)
+        .key_by(|e: &Event| e.user.clone())
+        .window(TumblingEventTimeWindows::of(Duration::from_secs(10)))
+        .trigger(FireOnThirdProcessingTickOnce {
+            ticks: 0,
+            fired: false,
+        })
+        .reduce(|a, b| Event {
+            user: a.user.clone(),
+            ts: a.ts.max(b.ts),
+            value: a.value + b.value,
+        })
+        .execute_with_parallelism_and_checkpoints(1, &[1])
+        .unwrap();
+
+    let values: Vec<i32> = out.result.into_iter().map(|r| r.value.1.value).collect();
+    assert_eq!(values, vec![1]);
+    assert_eq!(out.completed_checkpoints, vec![1]);
+}
+
+#[test]
+fn test_window_checkpoint_high_frequency_completes_within_timeout() {
+    let events = gen_events(2026, 180, 6);
+    let mut barrier_points: Vec<usize> = (0..=events.len()).step_by(15).collect();
+    if *barrier_points.last().unwrap() != events.len() {
+        barrier_points.push(events.len());
+    }
+    let expected_checkpoint_count = barrier_points.len();
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let env = StreamExecutionEnvironment::new("window-checkpoint-high-frequency");
+        let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+        let result = env
+            .from_iter(events)
+            .assign_timestamps_and_watermarks(strategy)
+            .key_by(|e: &Event| e.user.clone())
+            .window(TumblingEventTimeWindows::of(Duration::from_secs(5)))
+            .reduce(|a, b| Event {
+                user: a.user.clone(),
+                ts: a.ts.max(b.ts),
+                value: a.value + b.value,
+            })
+            .execute_with_parallelism_and_checkpoints(2, &barrier_points)
+            .map(|r| r.completed_checkpoints.len());
+        let _ = tx.send(result);
+    });
+
+    let completed = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("checkpointed window job should complete within timeout")
+        .expect("checkpointed window job should succeed");
+    assert_eq!(completed, expected_checkpoint_count);
+}
+
+#[test]
+fn test_window_checkpoint_deterministic_fuzz_matches_baseline() {
+    for seed in [11_u64, 97_u64, 409_u64] {
+        let events = gen_events(seed, 240, 5);
+        let barrier_points = vec![0usize, 80, 160, 240];
+
+        let env = StreamExecutionEnvironment::new("window-checkpoint-fuzz");
+        let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+        let baseline = env
+            .from_iter(events.clone())
+            .assign_timestamps_and_watermarks(strategy)
+            .key_by(|e: &Event| e.user.clone())
+            .window(TumblingEventTimeWindows::of(Duration::from_secs(5)))
+            .reduce(|a, b| Event {
+                user: a.user.clone(),
+                ts: a.ts.max(b.ts),
+                value: a.value + b.value,
+            })
+            .execute_with_parallelism(3)
+            .unwrap();
+
+        let strategy = BoundedOutOfOrderness::new(Duration::from_secs(2), |e: &Event| e.ts);
+        let checkpointed = env
+            .from_iter(events)
+            .assign_timestamps_and_watermarks(strategy)
+            .key_by(|e: &Event| e.user.clone())
+            .window(TumblingEventTimeWindows::of(Duration::from_secs(5)))
+            .reduce(|a, b| Event {
+                user: a.user.clone(),
+                ts: a.ts.max(b.ts),
+                value: a.value + b.value,
+            })
+            .execute_with_parallelism_and_checkpoints(3, &barrier_points)
+            .unwrap();
+
+        let mut baseline_norm: Vec<(i64, String, i32)> = baseline
+            .into_iter()
+            .map(|r| (r.timestamp.unwrap(), r.value.0, r.value.1.value))
+            .collect();
+        baseline_norm.sort();
+
+        let mut checkpointed_norm: Vec<(i64, String, i32)> = checkpointed
+            .result
+            .into_iter()
+            .map(|r| (r.timestamp.unwrap(), r.value.0, r.value.1.value))
+            .collect();
+        checkpointed_norm.sort();
+
+        assert_eq!(
+            baseline_norm, checkpointed_norm,
+            "seed={seed}: checkpointed output diverged from baseline"
+        );
+        assert_eq!(
+            checkpointed.completed_checkpoints.len(),
+            barrier_points.len(),
+            "seed={seed}: checkpoint completion count mismatch"
+        );
+    }
 }
 
 #[test]

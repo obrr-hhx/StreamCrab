@@ -1,10 +1,22 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use streamcrab_core::checkpoint::{
+    CheckpointCoordinator, InMemoryCheckpointStorage, TaskCheckpointAck, TaskCheckpointEvent,
+};
 use streamcrab_core::operator_chain::{Append, ChainEnd, FilterOp, FlatMapOp, MapOp, Operator};
+use streamcrab_core::task::{TaskId, VertexId};
 use streamcrab_core::time::WatermarkStrategy;
-use streamcrab_core::types::{EventTime, StreamData};
+use streamcrab_core::types::{CheckpointId, EventTime, StreamData};
 use streamcrab_core::window::{TimeWindow, Trigger, WindowAssigner};
+
+/// Parallel execution result with checkpoint completion details.
+pub struct CheckpointedExecutionResult<R> {
+    pub result: R,
+    pub completed_checkpoints: Vec<CheckpointId>,
+}
+
+type SharedReduceResults<K, V> = Arc<Mutex<std::collections::HashMap<K, V>>>;
 
 /// A stream of elements of type `T` with an operator chain of type `OpChain`.
 ///
@@ -288,6 +300,7 @@ where
     ///
     /// The output element is `(K, OUT)` and the record timestamp is set
     /// to the window's `max_timestamp()`.
+    #[allow(clippy::type_complexity)]
     pub fn aggregate<ACC, OUT, AGG>(
         self,
         agg: AGG,
@@ -326,6 +339,7 @@ where
     ///
     /// The output element is `(K, OpChain::OUT)` and the record timestamp is set
     /// to the window's `max_timestamp()`.
+    #[allow(clippy::type_complexity)]
     pub fn reduce<ReduceFn>(
         self,
         reduce_fn: ReduceFn,
@@ -589,9 +603,13 @@ where
         let mut worker_handles = Vec::new();
         let mut source_receivers_iter = source_receivers.into_iter();
 
-        for task_id in 0..parallelism {
+        for (_task_id, sender) in collector_senders
+            .iter()
+            .cloned()
+            .enumerate()
+            .take(parallelism)
+        {
             let receiver = source_receivers_iter.next().unwrap();
-            let sender = collector_senders[task_id].clone();
             let key_fn = self.key_fn.clone();
             let assigner = self.assigner.clone();
             let trigger = self.trigger.clone();
@@ -658,6 +676,291 @@ where
         }
 
         Ok(out_records)
+    }
+
+    /// Execute the windowed job in parallel with manual checkpoint barriers.
+    ///
+    /// `barrier_after_records` controls when to inject checkpoints by transformed-record
+    /// position. For example `[100, 500]` injects a checkpoint barrier after processing
+    /// the 100th and 500th transformed records in the source stage.
+    pub fn execute_with_parallelism_and_checkpoints(
+        mut self,
+        parallelism: usize,
+        barrier_after_records: &[usize],
+    ) -> anyhow::Result<CheckpointedExecutionResult<Vec<streamcrab_core::types::StreamRecord<OUT>>>>
+    where
+        WA: Clone,
+        Tr: Clone,
+        WFN: Clone,
+    {
+        use std::thread;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use streamcrab_core::channel::local_channel;
+        use streamcrab_core::partitioner::{HashPartitioner, Partitioner};
+        use streamcrab_core::time::EVENT_TIME_MAX;
+        use streamcrab_core::types::{StreamElement, StreamRecord, Watermark};
+        use streamcrab_core::window::WindowOperator;
+
+        if parallelism == 0 {
+            return Err(anyhow::anyhow!("parallelism must be greater than 0"));
+        }
+
+        let buffer_size = 1024;
+
+        let mut transformed_data: Vec<OpChain::OUT> = Vec::new();
+        self.op_chain
+            .process_batch(&self.source_data, &mut transformed_data)?;
+
+        let mut barrier_points = barrier_after_records.to_vec();
+        barrier_points.sort_unstable();
+        barrier_points.dedup();
+        if let Some(invalid) = barrier_points.iter().find(|&&p| p > transformed_data.len()) {
+            return Err(anyhow::anyhow!(
+                "checkpoint trigger position {} exceeds record count {}",
+                invalid,
+                transformed_data.len()
+            ));
+        }
+
+        let mut source_to_window_channels = Vec::new();
+        for _ in 0..parallelism {
+            source_to_window_channels.push(local_channel(buffer_size));
+        }
+
+        let source_senders: Vec<_> = source_to_window_channels
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect();
+        let source_receivers: Vec<_> = source_to_window_channels
+            .into_iter()
+            .map(|(_, receiver)| receiver)
+            .collect();
+
+        let mut window_to_collector_channels = Vec::new();
+        for _ in 0..parallelism {
+            window_to_collector_channels.push(local_channel(buffer_size));
+        }
+
+        let collector_senders: Vec<_> = window_to_collector_channels
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect();
+        let collector_receivers: Vec<_> = window_to_collector_channels
+            .into_iter()
+            .map(|(_, receiver)| receiver)
+            .collect();
+
+        let storage = Arc::new(InMemoryCheckpointStorage::new());
+        let mut coordinator_inner = CheckpointCoordinator::new(storage);
+        coordinator_inner.retained_checkpoints = 64;
+        let coordinator: Arc<CheckpointCoordinator<InMemoryCheckpointStorage>> =
+            Arc::new(coordinator_inner);
+        let expected_tasks: Vec<TaskId> = (0..parallelism)
+            .map(|idx| TaskId::new(VertexId::new(2), idx))
+            .collect();
+        let now_ms = || -> i64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
+        let mut checkpoint_plan = Vec::with_capacity(barrier_points.len());
+        for trigger_pos in barrier_points {
+            let barrier = coordinator.trigger_checkpoint(now_ms(), expected_tasks.clone())?;
+            checkpoint_plan.push((trigger_pos, barrier));
+        }
+        let checkpoint_count = checkpoint_plan.len();
+        let source_checkpoint_plan = checkpoint_plan.clone();
+        let (ack_sender, ack_receiver) = crossbeam_channel::unbounded::<TaskCheckpointEvent>();
+
+        let source_key_fn = self.key_fn.clone();
+        let timestamp_assigner = TimestampAssignerOperator::new(self.strategy);
+        let source_handle = thread::spawn(move || -> anyhow::Result<()> {
+            let partitioner = HashPartitioner::new(source_key_fn);
+            let mut generator = timestamp_assigner.create_watermark_generator::<OpChain::OUT>();
+            let mut last_emitted_wm = streamcrab_core::time::EVENT_TIME_MIN;
+            let mut processed = 0usize;
+            let mut checkpoint_idx = 0usize;
+
+            while checkpoint_idx < source_checkpoint_plan.len()
+                && source_checkpoint_plan[checkpoint_idx].0 == processed
+            {
+                let barrier = source_checkpoint_plan[checkpoint_idx].1;
+                for sender in &source_senders {
+                    sender.send(StreamElement::CheckpointBarrier(barrier))?;
+                }
+                checkpoint_idx += 1;
+            }
+
+            for item in transformed_data {
+                processed += 1;
+                let ts = timestamp_assigner.extract_timestamp(&item);
+
+                if ts > last_emitted_wm {
+                    generator.on_event(ts);
+                    let partition = partitioner.partition(&item, parallelism);
+                    source_senders[partition].send(StreamElement::timestamped_record(item, ts))?;
+
+                    if let Some(wm) = generator.current_watermark() {
+                        if wm.timestamp > last_emitted_wm {
+                            last_emitted_wm = wm.timestamp;
+                            for sender in &source_senders {
+                                sender.send(StreamElement::Watermark(wm))?;
+                            }
+                        }
+                    }
+                }
+
+                while checkpoint_idx < source_checkpoint_plan.len()
+                    && source_checkpoint_plan[checkpoint_idx].0 == processed
+                {
+                    let barrier = source_checkpoint_plan[checkpoint_idx].1;
+                    for sender in &source_senders {
+                        sender.send(StreamElement::CheckpointBarrier(barrier))?;
+                    }
+                    checkpoint_idx += 1;
+                }
+            }
+
+            let final_wm = Watermark::new(EVENT_TIME_MAX);
+            for sender in &source_senders {
+                sender.send(StreamElement::Watermark(final_wm))?;
+                sender.send(StreamElement::End)?;
+            }
+
+            Ok(())
+        });
+
+        let mut worker_handles = Vec::new();
+        let mut source_receivers_iter = source_receivers.into_iter();
+
+        for (task_id, sender) in collector_senders
+            .iter()
+            .cloned()
+            .enumerate()
+            .take(parallelism)
+        {
+            let receiver = source_receivers_iter.next().unwrap();
+            let ack_sender = ack_sender.clone();
+            let task_id = TaskId::new(VertexId::new(2), task_id);
+            let key_fn = self.key_fn.clone();
+            let assigner = self.assigner.clone();
+            let trigger = self.trigger.clone();
+            let window_fn = self.window_fn.clone();
+
+            let handle = thread::spawn(move || -> anyhow::Result<()> {
+                let mut operator = WindowOperator::new(
+                    key_fn,
+                    |_e: &OpChain::OUT| 0i64,
+                    assigner,
+                    trigger,
+                    window_fn,
+                );
+                let processing_time_ms = || -> i64 {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                };
+
+                loop {
+                    let element = receiver.recv()?;
+                    match element {
+                        StreamElement::CheckpointBarrier(barrier) => {
+                            let snapshot = operator.snapshot_state()?;
+                            ack_sender
+                                .send(TaskCheckpointEvent::Ack(TaskCheckpointAck {
+                                    checkpoint_id: barrier.checkpoint_id,
+                                    task_id,
+                                    state: snapshot,
+                                }))
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to send checkpoint ack: {e}")
+                                })?;
+                            sender.send(StreamElement::CheckpointBarrier(barrier))?;
+                            for out in operator.on_processing_time(processing_time_ms())? {
+                                sender.send(out)?;
+                            }
+                        }
+                        other => {
+                            let is_end = matches!(other, StreamElement::End);
+                            for out in operator.process(other)? {
+                                sender.send(out)?;
+                            }
+                            for out in operator.on_processing_time(processing_time_ms())? {
+                                sender.send(out)?;
+                            }
+                            if is_end {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            });
+
+            worker_handles.push(handle);
+        }
+
+        // Drop local sender handle so ack thread can observe channel close on worker failure.
+        drop(ack_sender);
+        let ack_handle = if checkpoint_count == 0 {
+            None
+        } else {
+            let coordinator: Arc<CheckpointCoordinator<InMemoryCheckpointStorage>> =
+                Arc::clone(&coordinator);
+            let expected_event_count = checkpoint_count * parallelism;
+            Some(thread::spawn(move || -> anyhow::Result<()> {
+                for _ in 0..expected_event_count {
+                    let event = ack_receiver
+                        .recv()
+                        .map_err(|e| anyhow::anyhow!("checkpoint event channel closed: {e}"))?;
+                    match event {
+                        TaskCheckpointEvent::Ack(ack) => {
+                            coordinator.acknowledge_checkpoint(ack)?;
+                        }
+                        TaskCheckpointEvent::Aborted(abort) => {
+                            coordinator.abort_checkpoint(
+                                abort.checkpoint_id,
+                                abort.task_id,
+                                &abort.reason,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }))
+        };
+
+        let mut out_records: Vec<StreamRecord<OUT>> = Vec::new();
+        let mut ended_count = 0usize;
+        let total_tasks = collector_receivers.len();
+
+        while ended_count < total_tasks {
+            for receiver in &collector_receivers {
+                match receiver.try_recv()? {
+                    Some(StreamElement::Record(record)) => out_records.push(record),
+                    Some(StreamElement::End) => ended_count += 1,
+                    Some(_) | None => {}
+                }
+            }
+            thread::sleep(std::time::Duration::from_micros(100));
+        }
+
+        source_handle.join().unwrap()?;
+        for handle in worker_handles {
+            handle.join().unwrap()?;
+        }
+        if let Some(ack_handle) = ack_handle {
+            ack_handle.join().unwrap()?;
+        }
+
+        let completed_checkpoints = coordinator.completed_checkpoint_ids()?;
+        Ok(CheckpointedExecutionResult {
+            result: out_records,
+            completed_checkpoints,
+        })
     }
 }
 
@@ -838,7 +1141,7 @@ where
     pub fn execute_with_parallelism(
         mut self,
         parallelism: usize,
-    ) -> anyhow::Result<Arc<Mutex<std::collections::HashMap<K, OpChain::OUT>>>> {
+    ) -> anyhow::Result<SharedReduceResults<K, OpChain::OUT>> {
         if parallelism == 0 {
             return Err(anyhow::anyhow!("parallelism must be greater than 0"));
         }
@@ -879,6 +1182,131 @@ where
         Self::join_worker(collector_handle, "collector")?;
 
         Ok(results)
+    }
+
+    /// Execute with manual checkpoint barrier injection at specific record counts.
+    ///
+    /// `barrier_after_records` contains processed-record offsets at which a checkpoint
+    /// barrier should be broadcast to all reduce workers. For example `[100, 500]`
+    /// injects barriers after the 100th and 500th transformed records.
+    pub fn execute_with_parallelism_and_checkpoints(
+        mut self,
+        parallelism: usize,
+        barrier_after_records: &[usize],
+    ) -> anyhow::Result<CheckpointedExecutionResult<SharedReduceResults<K, OpChain::OUT>>> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        if parallelism == 0 {
+            return Err(anyhow::anyhow!("parallelism must be greater than 0"));
+        }
+
+        let buffer_size = 1024;
+        let results = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let mut transformed_data = Vec::new();
+        self.op_chain
+            .process_batch(&self.source_data, &mut transformed_data)?;
+
+        let mut barrier_points = barrier_after_records.to_vec();
+        barrier_points.sort_unstable();
+        barrier_points.dedup();
+        if let Some(invalid) = barrier_points.iter().find(|&&p| p > transformed_data.len()) {
+            return Err(anyhow::anyhow!(
+                "checkpoint trigger position {} exceeds record count {}",
+                invalid,
+                transformed_data.len()
+            ));
+        }
+
+        let (source_senders, source_receivers) =
+            Self::create_channels::<OpChain::OUT>(parallelism, buffer_size);
+        let (collector_senders, collector_receivers) =
+            Self::create_channels::<(K, OpChain::OUT)>(parallelism, buffer_size);
+
+        let storage = Arc::new(InMemoryCheckpointStorage::new());
+        let mut coordinator_inner = CheckpointCoordinator::new(storage);
+        coordinator_inner.retained_checkpoints = 64;
+        let coordinator: Arc<CheckpointCoordinator<InMemoryCheckpointStorage>> =
+            Arc::new(coordinator_inner);
+        let expected_tasks: Vec<TaskId> = (0..parallelism)
+            .map(|idx| TaskId::new(VertexId::new(1), idx))
+            .collect();
+
+        let now_ms = || -> i64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
+
+        let mut checkpoint_plan = Vec::with_capacity(barrier_points.len());
+        for trigger_pos in barrier_points {
+            let barrier = coordinator.trigger_checkpoint(now_ms(), expected_tasks.clone())?;
+            checkpoint_plan.push((trigger_pos, barrier));
+        }
+
+        let (ack_sender, ack_receiver) = crossbeam_channel::unbounded::<TaskCheckpointEvent>();
+
+        let source_handle = Self::spawn_source_task_with_checkpoints(
+            transformed_data,
+            self.key_fn.clone(),
+            parallelism,
+            source_senders,
+            checkpoint_plan.clone(),
+        );
+        let reduce_handles = Self::spawn_reduce_tasks_with_checkpoints(
+            parallelism,
+            source_receivers,
+            collector_senders,
+            self.key_fn,
+            self.reduce_fn,
+            ack_sender,
+        );
+        let collector_handle =
+            Self::spawn_collector_task(collector_receivers, Arc::clone(&results));
+
+        let ack_handle = if checkpoint_plan.is_empty() {
+            None
+        } else {
+            let coordinator: Arc<CheckpointCoordinator<InMemoryCheckpointStorage>> =
+                Arc::clone(&coordinator);
+            let expected_event_count = checkpoint_plan.len() * parallelism;
+            Some(std::thread::spawn(move || -> anyhow::Result<()> {
+                for _ in 0..expected_event_count {
+                    let event = ack_receiver
+                        .recv()
+                        .map_err(|e| anyhow::anyhow!("checkpoint event channel closed: {e}"))?;
+                    match event {
+                        TaskCheckpointEvent::Ack(ack) => {
+                            coordinator.acknowledge_checkpoint(ack)?;
+                        }
+                        TaskCheckpointEvent::Aborted(abort) => {
+                            coordinator.abort_checkpoint(
+                                abort.checkpoint_id,
+                                abort.task_id,
+                                &abort.reason,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }))
+        };
+
+        Self::join_worker(source_handle, "source")?;
+        for handle in reduce_handles {
+            Self::join_worker(handle, "reduce")?;
+        }
+        Self::join_worker(collector_handle, "collector")?;
+        if let Some(ack_handle) = ack_handle {
+            Self::join_worker(ack_handle, "checkpoint-ack")?;
+        }
+
+        let completed_checkpoints = coordinator.completed_checkpoint_ids()?;
+        Ok(CheckpointedExecutionResult {
+            result: results,
+            completed_checkpoints,
+        })
     }
 
     fn create_channels<U>(
@@ -933,6 +1361,56 @@ where
         })
     }
 
+    fn spawn_source_task_with_checkpoints(
+        transformed_data: Vec<OpChain::OUT>,
+        key_fn: KeyFn,
+        parallelism: usize,
+        source_senders: Vec<streamcrab_core::channel::LocalChannelSender<OpChain::OUT>>,
+        checkpoint_plan: Vec<(usize, streamcrab_core::types::Barrier)>,
+    ) -> std::thread::JoinHandle<anyhow::Result<()>> {
+        use std::thread;
+        use streamcrab_core::partitioner::{HashPartitioner, Partitioner};
+        use streamcrab_core::types::StreamElement;
+
+        thread::spawn(move || -> anyhow::Result<()> {
+            let partitioner = HashPartitioner::new(key_fn);
+            let mut processed = 0usize;
+            let mut checkpoint_idx = 0usize;
+
+            while checkpoint_idx < checkpoint_plan.len()
+                && checkpoint_plan[checkpoint_idx].0 == processed
+            {
+                let barrier = checkpoint_plan[checkpoint_idx].1;
+                for sender in &source_senders {
+                    sender.send(StreamElement::CheckpointBarrier(barrier))?;
+                }
+                checkpoint_idx += 1;
+            }
+
+            for item in transformed_data {
+                let partition = partitioner.partition(&item, parallelism);
+                source_senders[partition].send(StreamElement::record(item))?;
+                processed += 1;
+
+                while checkpoint_idx < checkpoint_plan.len()
+                    && checkpoint_plan[checkpoint_idx].0 == processed
+                {
+                    let barrier = checkpoint_plan[checkpoint_idx].1;
+                    for sender in &source_senders {
+                        sender.send(StreamElement::CheckpointBarrier(barrier))?;
+                    }
+                    checkpoint_idx += 1;
+                }
+            }
+
+            for sender in &source_senders {
+                sender.send(StreamElement::End)?;
+            }
+
+            Ok(())
+        })
+    }
+
     fn spawn_reduce_tasks(
         parallelism: usize,
         source_receivers: Vec<streamcrab_core::channel::LocalChannelReceiver<OpChain::OUT>>,
@@ -948,9 +1426,8 @@ where
         let mut handles = Vec::with_capacity(parallelism);
         let mut receivers_iter = source_receivers.into_iter();
 
-        for task_id in 0..parallelism {
+        for sender in collector_senders.into_iter().take(parallelism) {
             let receiver = receivers_iter.next().unwrap();
-            let sender = collector_senders[task_id].clone();
             let key_fn = key_fn.clone();
             let reduce_fn = reduce_fn.clone();
 
@@ -972,6 +1449,80 @@ where
                             for result in output {
                                 sender.send(StreamElement::record(result))?;
                             }
+                        }
+                        StreamElement::End => {
+                            sender.send(StreamElement::End)?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        handles
+    }
+
+    fn spawn_reduce_tasks_with_checkpoints(
+        parallelism: usize,
+        source_receivers: Vec<streamcrab_core::channel::LocalChannelReceiver<OpChain::OUT>>,
+        collector_senders: Vec<streamcrab_core::channel::LocalChannelSender<(K, OpChain::OUT)>>,
+        key_fn: KeyFn,
+        reduce_fn: ReduceFn,
+        ack_sender: crossbeam_channel::Sender<TaskCheckpointEvent>,
+    ) -> Vec<std::thread::JoinHandle<anyhow::Result<()>>> {
+        use std::thread;
+        use streamcrab_core::process::ReduceOperator;
+        use streamcrab_core::state::HashMapStateBackend;
+        use streamcrab_core::types::StreamElement;
+
+        let mut handles = Vec::with_capacity(parallelism);
+        let mut receivers_iter = source_receivers.into_iter();
+
+        for (subtask, sender) in collector_senders.into_iter().enumerate().take(parallelism) {
+            let receiver = receivers_iter.next().unwrap();
+            let key_fn = key_fn.clone();
+            let reduce_fn = reduce_fn.clone();
+            let ack_sender = ack_sender.clone();
+            let task_id = TaskId::new(VertexId::new(1), subtask);
+
+            let handle = thread::spawn(move || -> anyhow::Result<()> {
+                let reducer = FnReduceFunction { reduce_fn };
+                let backend = HashMapStateBackend::new();
+                let mut operator = ReduceOperator::new(reducer, backend);
+
+                loop {
+                    let element = receiver.recv()?;
+                    match element {
+                        StreamElement::Record(record) => {
+                            let item = record.value;
+                            let key = key_fn(&item);
+                            let input = vec![(key, item)];
+                            let mut output = Vec::new();
+                            operator.process_batch(&input, &mut output)?;
+
+                            for result in output {
+                                sender.send(StreamElement::record(result))?;
+                            }
+                        }
+                        StreamElement::CheckpointBarrier(barrier) => {
+                            let snapshot =
+                                streamcrab_core::operator_chain::Operator::snapshot_state(
+                                    &operator,
+                                )?;
+                            ack_sender
+                                .send(TaskCheckpointEvent::Ack(TaskCheckpointAck {
+                                    checkpoint_id: barrier.checkpoint_id,
+                                    task_id,
+                                    state: snapshot,
+                                }))
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to send checkpoint ack: {e}")
+                                })?;
+                            sender.send(StreamElement::CheckpointBarrier(barrier))?;
                         }
                         StreamElement::End => {
                             sender.send(StreamElement::End)?;
