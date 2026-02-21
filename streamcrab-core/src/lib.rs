@@ -16,6 +16,7 @@
 //! - [`time`] / [`window`] — Event-time/watermark and windowing semantics.
 
 pub mod checkpoint;
+pub mod cluster;
 pub mod graph;
 pub mod network;
 pub mod runtime;

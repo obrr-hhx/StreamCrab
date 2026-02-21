@@ -104,7 +104,8 @@ fn test_task_processing_time_tick_emits() {
         .with_processing_time_tick(Duration::from_millis(1));
 
     let sender_handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(5));
+        // Give task loop enough time slices to observe at least one tick on loaded CI machines.
+        std::thread::sleep(Duration::from_millis(20));
         input_sender.send(StreamElement::End).unwrap();
     });
 

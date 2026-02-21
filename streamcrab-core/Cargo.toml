@@ -12,3 +12,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ahash = { workspace = true }
 crossbeam-channel = { workspace = true }
+tonic = "0.12"
+prost = "0.13"
+tokio = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"

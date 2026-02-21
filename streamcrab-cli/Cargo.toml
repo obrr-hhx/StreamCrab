@@ -1,0 +1,16 @@
+[package]
+name = "streamcrab-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "streamcrab"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tonic = "0.12"
+streamcrab-core = { workspace = true }
