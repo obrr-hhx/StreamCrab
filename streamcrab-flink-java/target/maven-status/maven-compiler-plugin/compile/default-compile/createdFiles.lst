@@ -1,0 +1,4 @@
+io/streamcrab/flink/NativeOperator.class
+io/streamcrab/flink/NativeLibLoader.class
+io/streamcrab/flink/ArrowBatchConverter.class
+io/streamcrab/flink/NativeOneInputStreamOperator.class

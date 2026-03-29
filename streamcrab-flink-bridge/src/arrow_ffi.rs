@@ -16,22 +16,26 @@ use streamcrab_vectorized::VeloxBatch;
 ///
 /// # Safety
 /// `schema_ptr` and `array_ptr` must be valid, non-null pointers to
-/// heap-allocated `FFI_ArrowSchema` and `FFI_ArrowArray` instances that were
-/// produced by Arrow Java's `Data.exportRecordBatch`.  Ownership is transferred
-/// to this function (the caller must not free them).
+/// `FFI_ArrowSchema` and `FFI_ArrowArray` instances that were populated by
+/// Arrow Java's `Data.exportVectorSchemaRoot`.
+///
+/// This function reads the FFI structs in place (via `std::ptr::read`) so that
+/// Arrow's `from_ffi` can invoke the C release callbacks.  The original memory
+/// at the pointer addresses is left in an indeterminate state — the Java side
+/// should close its `ArrowArray`/`ArrowSchema` wrappers afterwards (the close
+/// is a no-op once the release callback has fired).
 pub unsafe fn import_batch(schema_ptr: i64, array_ptr: i64) -> Result<VeloxBatch> {
-    // `from_ffi` takes ownership of `ffi_array` (moves it), and borrows
-    // `ffi_schema` for the duration of the call.  Both are freed by their
-    // respective Drop impls (which invoke the C release callback).
     let array_data = unsafe {
-        let ffi_schema = Box::from_raw(schema_ptr as *mut FFI_ArrowSchema);
-        let ffi_array = Box::from_raw(array_ptr as *mut FFI_ArrowArray);
-        // `*ffi_array` moves out of the box; `ffi_schema` is dropped at end of block.
-        from_ffi(*ffi_array, &*ffi_schema).context("arrow_ffi: from_ffi")?
+        // Read (bitwise copy) the structs out of Java-owned memory.  `from_ffi`
+        // will invoke the release callback on the *copied* struct, which signals
+        // Arrow Java to free its buffers.  We do NOT use `Box::from_raw` because
+        // the memory was allocated by Java's Arrow allocator, not by Rust's
+        // global allocator.
+        let ffi_schema = std::ptr::read(schema_ptr as *const FFI_ArrowSchema);
+        let ffi_array = std::ptr::read(array_ptr as *const FFI_ArrowArray);
+        from_ffi(ffi_array, &ffi_schema).context("arrow_ffi: from_ffi")?
     };
 
-    // A RecordBatch is represented on the C interface as a StructArray whose
-    // children are the columns.
     let struct_array = StructArray::from(array_data);
     let batch = RecordBatch::from(struct_array);
     Ok(VeloxBatch::new(batch))

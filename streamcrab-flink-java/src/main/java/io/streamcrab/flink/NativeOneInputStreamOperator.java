@@ -156,14 +156,16 @@ public class NativeOneInputStreamOperator
     }
 
     private void emitArrowResult(long resultPtr) throws Exception {
-        // TODO Phase 5: Convert Arrow result back to Row and emit via output.collect()
-        // This requires reading the ArrowResult struct from the pointer
-        // and converting the Arrow batch back to Flink Rows.
-        // For now, this is a placeholder that will be filled in Phase 5 integration.
+        // The ArrowResult struct layout: { i64 schema_ptr, i64 array_ptr }
+        long[] ptrs = converter.readArrowResultStruct(resultPtr);
+        long schemaPtr = ptrs[0];
+        long arrayPtr = ptrs[1];
 
-        // List<Row> rows = converter.arrowFfiToRows(resultPtr);
-        // for (Row row : rows) {
-        //     output.collect(new StreamRecord<>(row));
-        // }
+        if (schemaPtr != 0 && arrayPtr != 0) {
+            List<Row> rows = converter.arrowFfiToRows(schemaPtr, arrayPtr);
+            for (Row row : rows) {
+                output.collect(new StreamRecord<>(row));
+            }
+        }
     }
 }
