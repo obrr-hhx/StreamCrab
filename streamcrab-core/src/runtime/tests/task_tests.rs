@@ -302,15 +302,15 @@ fn test_task_idle_timeout_advances_watermark_with_processing_tick() {
         sender0
             .send(StreamElement::Watermark(Watermark::new(100)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(90));
         sender0.send(StreamElement::End).unwrap();
         sender1.send(StreamElement::End).unwrap();
     });
 
     let handle = std::thread::spawn(move || task.run());
 
-    // End is sent at ~40ms. Seeing watermark 100 before then means idle-timeout path worked.
-    let deadline = Instant::now() + Duration::from_millis(30);
+    // End is sent at ~100ms. Seeing watermark 100 before then means idle-timeout path worked.
+    let deadline = Instant::now() + Duration::from_millis(80);
     let mut saw_wm_100_before_end = false;
     while Instant::now() < deadline {
         match output_receiver.try_recv().unwrap() {

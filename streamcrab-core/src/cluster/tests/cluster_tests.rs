@@ -7,13 +7,18 @@ use tokio::sync::mpsc;
 use tonic::Request;
 
 use crate::cluster::rpc::job_manager_service_client::JobManagerServiceClient;
+use crate::cluster::rpc::job_manager_service_server::JobManagerService;
 use crate::cluster::rpc::task_manager_service_server::TaskManagerService;
 use crate::cluster::{
     ClusterConfig, HeartbeatConfig, JobManager, OperatorFactory, Resources, RoundRobinScheduler,
-    TaskManager, TaskManagerRpc,
+    TaskManager, TaskManagerRpc, JobManagerRpc,
 };
+use crate::elastic::{ElasticConfig, ScalePolicy};
 use crate::network::{FrameType, decode_stream_element, encode_stream_element, write_frame};
-use crate::runtime::descriptors::{JobPlan, OperatorDescriptor, PartitionDescriptor};
+use crate::runtime::descriptors::{
+    JobPlan, OperatorDescriptor, OperatorRuntimeConfig, PartitionDescriptor, SinkGuarantee,
+};
+use crate::state::StateMode;
 use crate::types::StreamElement;
 
 #[test]
@@ -99,6 +104,8 @@ fn test_job_manager_register_heartbeat_and_evict_stale() {
             interval: Duration::from_millis(10),
             timeout: Duration::from_millis(5),
         },
+        state_service_endpoint: None,
+        ..ClusterConfig::default()
     };
     let jm = JobManager::new(config);
     assert!(jm.register_task_manager(
@@ -108,7 +115,7 @@ fn test_job_manager_register_heartbeat_and_evict_stale() {
         Resources::default(),
     ));
     assert_eq!(jm.task_manager_count(), 1);
-    assert!(jm.heartbeat("tm-1"));
+    assert!(jm.heartbeat("tm-1", 50, 10_000));
 
     std::thread::sleep(Duration::from_millis(8));
     let removed = jm.evict_stale_task_managers();
@@ -192,6 +199,156 @@ async fn test_task_manager_rpc_deploy_and_cancel() {
 }
 
 #[tokio::test]
+async fn test_job_manager_trigger_rescale_rejects_missing_job() {
+    let jm = Arc::new(JobManager::new(ClusterConfig::default()));
+    let rpc = crate::cluster::JobManagerRpc::new(Arc::clone(&jm));
+
+    let response = rpc
+        .trigger_rescale(Request::new(crate::cluster::rpc::TriggerRescaleRequest {
+            job_id: "job-missing".to_string(),
+            operator_id: 1,
+            new_parallelism: 8,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.accepted);
+    assert_eq!(response.generation, 0);
+}
+
+#[tokio::test]
+async fn test_job_manager_trigger_rescale_scale_up_advances_phase_and_parallelism() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig::default()));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-rescale".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        4,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes(1),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
+
+    let generation = jm.trigger_rescale(&job_id, 1, 2).await.unwrap();
+    assert!(generation > 0);
+
+    wait_until(Duration::from_secs(2), || {
+        jm.job_parallelism_for_test(&job_id) == Some(2)
+    })
+    .await;
+    assert!(
+        tm.deployed_task_count() >= 2,
+        "scaled-up topology should deploy additional task instance"
+    );
+    assert_eq!(
+        jm.latest_rescale_generation_for_test(&job_id),
+        Some(generation)
+    );
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_job_manager_multi_step_rescale_4_8_16_8_4() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig::default()));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-rescale-multi".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        32,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                4,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Tiered {
+                        state_service: "127.0.0.1:7000".to_string(),
+                    },
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 4,
+                        max_parallelism: 16,
+                        scale_policy: ScalePolicy::Manual,
+                        cooldown: Duration::from_millis(1),
+                    }),
+                }],
+                None,
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 4,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() >= 4).await;
+
+    let mut last_generation = 0;
+    for target in [8usize, 16, 8, 4] {
+        let started = std::time::Instant::now();
+        let generation = jm.trigger_rescale(&job_id, 1, target).await.unwrap();
+        assert!(generation > last_generation);
+        last_generation = generation;
+        wait_until(Duration::from_secs(2), || {
+            jm.job_parallelism_for_test(&job_id) == Some(target)
+        })
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "rescale to {} should complete within 5s in test setup",
+            target
+        );
+    }
+
+    assert_eq!(jm.job_parallelism_for_test(&job_id), Some(4));
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
 async fn test_task_manager_redeploy_same_task_replaces_channel_mapping() {
     let tm = Arc::new(TaskManager::new(
         "tm-redeploy".to_string(),
@@ -261,6 +418,455 @@ async fn test_task_manager_redeploy_same_task_replaces_channel_mapping() {
     assert!(reused_old_channel.success);
 }
 
+#[tokio::test]
+async fn test_job_manager_trigger_rescale_rejects_local_state_mode_operator() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig::default()));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-local-mode".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        4,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                1,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Local,
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 1,
+                        max_parallelism: 4,
+                        scale_policy: ScalePolicy::Backpressure {
+                            scale_up_threshold: 0.8,
+                            scale_down_threshold: 0.2,
+                        },
+                        cooldown: Duration::from_secs(1),
+                    }),
+                }],
+                None,
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
+
+    let err = jm.trigger_rescale(&job_id, 1, 2).await.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("online rescale requires Tiered"));
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_job_manager_trigger_rescale_rejects_session_window_operator() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig::default()));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-session-window".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        4,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                1,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Tiered {
+                        state_service: "127.0.0.1:7000".to_string(),
+                    },
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 1,
+                        max_parallelism: 4,
+                        scale_policy: ScalePolicy::Backpressure {
+                            scale_up_threshold: 0.8,
+                            scale_down_threshold: 0.2,
+                        },
+                        cooldown: Duration::from_secs(1),
+                    }),
+                }],
+                Some("Session(30000)"),
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
+
+    let err = jm.trigger_rescale(&job_id, 1, 2).await.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("does not support online rescale"));
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_job_manager_autoscaler_tick_triggers_rescale_for_tiered_operator() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig {
+        autoscaler_interval: Duration::from_millis(1),
+        autoscaler_cooldown: Duration::from_millis(1),
+        ..ClusterConfig::default()
+    }));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-autoscaler".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        8,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                1,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Tiered {
+                        state_service: "127.0.0.1:7000".to_string(),
+                    },
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 1,
+                        max_parallelism: 4,
+                        scale_policy: ScalePolicy::Backpressure {
+                            scale_up_threshold: 0.8,
+                            scale_down_threshold: 0.2,
+                        },
+                        cooldown: Duration::from_millis(1),
+                    }),
+                }],
+                None,
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
+
+    assert!(jm.heartbeat("tm-autoscaler", 95, 100_000));
+    jm.run_autoscaler_once_if_due().await.unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        jm.job_parallelism_for_test(&job_id) == Some(2)
+    })
+    .await;
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_job_manager_autoscaler_tick_scales_down_on_low_backpressure() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig {
+        autoscaler_interval: Duration::from_millis(1),
+        autoscaler_cooldown: Duration::from_millis(1),
+        ..ClusterConfig::default()
+    }));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-autoscaler-down".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        8,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                2,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Tiered {
+                        state_service: "127.0.0.1:7000".to_string(),
+                    },
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 1,
+                        max_parallelism: 4,
+                        scale_policy: ScalePolicy::Backpressure {
+                            scale_up_threshold: 0.8,
+                            scale_down_threshold: 0.2,
+                        },
+                        cooldown: Duration::from_millis(1),
+                    }),
+                }],
+                None,
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() >= 2).await;
+
+    assert!(jm.heartbeat("tm-autoscaler-down", 0, 200_000));
+    jm.run_autoscaler_once_if_due().await.unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        jm.job_parallelism_for_test(&job_id) == Some(1)
+    })
+    .await;
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_job_manager_autoscaler_respects_cluster_cooldown() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig {
+        autoscaler_interval: Duration::from_millis(1),
+        autoscaler_cooldown: Duration::from_secs(1),
+        ..ClusterConfig::default()
+    }));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-autoscaler-cooldown".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        8,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                1,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Tiered {
+                        state_service: "127.0.0.1:7000".to_string(),
+                    },
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 1,
+                        max_parallelism: 4,
+                        scale_policy: ScalePolicy::Backpressure {
+                            scale_up_threshold: 0.8,
+                            scale_down_threshold: 0.2,
+                        },
+                        cooldown: Duration::from_millis(1),
+                    }),
+                }],
+                None,
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
+
+    assert!(jm.heartbeat("tm-autoscaler-cooldown", 95, 100_000));
+    jm.run_autoscaler_once_if_due().await.unwrap();
+    wait_until(Duration::from_secs(2), || {
+        jm.job_parallelism_for_test(&job_id) == Some(2)
+    })
+    .await;
+
+    // Immediately push low queue usage and trigger another tick.
+    // Cooldown should prevent scale-down back to 1.
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(jm.heartbeat("tm-autoscaler-cooldown", 0, 1_000_000));
+    jm.run_autoscaler_once_if_due().await.unwrap();
+    assert_eq!(jm.job_parallelism_for_test(&job_id), Some(2));
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_job_manager_heartbeat_rpc_runs_autoscaler_evaluation() {
+    let jm_addr = reserve_local_addr().await;
+    let jm_endpoint = format!("http://{}", jm_addr);
+    let jm = Arc::new(JobManager::new(ClusterConfig {
+        autoscaler_interval: Duration::from_millis(1),
+        autoscaler_cooldown: Duration::from_millis(1),
+        ..ClusterConfig::default()
+    }));
+    let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
+
+    let tm_addr = reserve_local_addr().await;
+    let tm = Arc::new(TaskManager::new(
+        "tm-autoscaler-rpc".to_string(),
+        jm_endpoint.clone(),
+        tm_addr.to_string(),
+        8,
+        Resources::default(),
+        HeartbeatConfig::default(),
+    ));
+    let tm_handle = tokio::spawn(Arc::clone(&tm).serve(tm_addr));
+    tm.register_with_retry(20, Duration::from_millis(20))
+        .await
+        .unwrap();
+
+    let mut client = JobManagerServiceClient::connect(jm_endpoint.clone())
+        .await
+        .unwrap();
+    let submit = client
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                1,
+                vec![OperatorRuntimeConfig {
+                    operator_id: 1,
+                    state_mode: StateMode::Tiered {
+                        state_service: "127.0.0.1:7000".to_string(),
+                    },
+                    elastic_config: Some(ElasticConfig {
+                        min_parallelism: 1,
+                        max_parallelism: 4,
+                        scale_policy: ScalePolicy::Backpressure {
+                            scale_up_threshold: 0.8,
+                            scale_down_threshold: 0.2,
+                        },
+                        cooldown: Duration::from_millis(1),
+                    }),
+                }],
+                None,
+                SinkGuarantee::Idempotent,
+            ),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(submit.accepted);
+    let job_id = submit.job_id;
+    wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
+
+    client
+        .heartbeat(Request::new(crate::cluster::rpc::HeartbeatRequest {
+            tm_id: "tm-autoscaler-rpc".to_string(),
+            timestamp: crate::cluster::current_unix_millis(),
+            queue_usage: 98,
+            throughput: 50_000,
+        }))
+        .await
+        .unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        jm.job_parallelism_for_test(&job_id) == Some(2)
+    })
+    .await;
+
+    tm_handle.abort();
+    jm_handle.abort();
+}
+
+#[tokio::test]
+async fn test_submit_job_rejects_at_least_once_sink() {
+    let jm = Arc::new(JobManager::new(ClusterConfig::default()));
+    let rpc = JobManagerRpc::new(Arc::clone(&jm));
+    let err = rpc
+        .submit_job(Request::new(crate::cluster::rpc::SubmitJobRequest {
+            job_plan: sample_job_plan_bytes_with_runtime(
+                1,
+                vec![],
+                None,
+                SinkGuarantee::AtLeastOnce,
+            ),
+            parallelism: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert!(err
+        .message()
+        .contains("requires idempotent or 2PC sink"));
+}
+
 #[test]
 fn test_operator_factory_rejects_unknown_udf() {
     let factory = OperatorFactory::new();
@@ -272,6 +878,7 @@ fn test_operator_factory_rejects_unknown_udf() {
             config: vec![],
         }],
         edges: vec![],
+        operator_runtime: vec![],
     };
     let err = factory.validate_job_plan(&plan).unwrap_err();
     assert!(err.to_string().contains("unknown udf_id"));
@@ -288,6 +895,7 @@ fn test_operator_factory_accepts_builtin_udf() {
             config: vec![],
         }],
         edges: vec![],
+        operator_runtime: vec![],
     };
     factory.validate_job_plan(&plan).unwrap();
 }
@@ -829,6 +1437,8 @@ async fn test_cluster_global_rollback_on_tm_failure() {
             interval: Duration::from_millis(10),
             timeout: Duration::from_millis(40),
         },
+        state_service_endpoint: None,
+        ..ClusterConfig::default()
     }));
     let jm_handle = tokio::spawn(Arc::clone(&jm).serve(jm_addr));
 
@@ -887,6 +1497,24 @@ async fn test_cluster_global_rollback_on_tm_failure() {
     })
     .await;
 
+    jm.report_source_offset(&job_id, 100).unwrap();
+    let cp = client
+        .trigger_checkpoint(Request::new(crate::cluster::rpc::TriggerCheckpointRequest {
+            job_id: job_id.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(cp.accepted);
+    wait_until(Duration::from_secs(2), || {
+        tm_alive.completed_checkpoint_ids().contains(&cp.checkpoint_id)
+            && tm_fail.completed_checkpoint_ids().contains(&cp.checkpoint_id)
+    })
+    .await;
+    assert_eq!(jm.committed_source_offset_for_test(&job_id), Some(100));
+    jm.report_source_offset(&job_id, 200).unwrap();
+    assert_eq!(jm.source_offset_for_test(&job_id), Some(200));
+
     tm_fail_handle.abort();
     tokio::time::sleep(Duration::from_millis(60)).await;
     tm_alive.send_heartbeat().await.unwrap();
@@ -907,6 +1535,11 @@ async fn test_cluster_global_rollback_on_tm_failure() {
         status.status,
         i32::from(crate::cluster::JobStatus::Running),
         "job should recover to running"
+    );
+    assert_eq!(
+        jm.source_offset_for_test(&job_id),
+        Some(100),
+        "source offset should roll back to last sealed checkpoint"
     );
 
     tm_alive_handle.abort();
@@ -1491,10 +2124,32 @@ async fn wait_bridged_input(
 }
 
 fn sample_job_plan_bytes(parallelism: u32) -> Vec<u8> {
-    JobPlan {
-        job_name: "e2e".to_string(),
-        parallelism,
-        operators: vec![
+    sample_job_plan_bytes_with_runtime(parallelism, vec![], None, SinkGuarantee::Idempotent)
+}
+
+fn sample_job_plan_bytes_with_runtime(
+    parallelism: u32,
+    operator_runtime: Vec<OperatorRuntimeConfig>,
+    window_assigner: Option<&str>,
+    sink_guarantee: SinkGuarantee,
+) -> Vec<u8> {
+    let operators = if let Some(assigner) = window_assigner {
+        vec![
+            OperatorDescriptor::Source {
+                source_id: "source-1".to_string(),
+            },
+            OperatorDescriptor::Window {
+                assigner: assigner.to_string(),
+                trigger: "EventTime".to_string(),
+                function_id: "builtin::identity".to_string(),
+            },
+            OperatorDescriptor::Sink {
+                sink_id: "sink-1".to_string(),
+                guarantee: sink_guarantee,
+            },
+        ]
+    } else {
+        vec![
             OperatorDescriptor::Source {
                 source_id: "source-1".to_string(),
             },
@@ -1504,8 +2159,15 @@ fn sample_job_plan_bytes(parallelism: u32) -> Vec<u8> {
             },
             OperatorDescriptor::Sink {
                 sink_id: "sink-1".to_string(),
+                guarantee: sink_guarantee,
             },
-        ],
+        ]
+    };
+
+    JobPlan {
+        job_name: "e2e".to_string(),
+        parallelism,
+        operators,
         edges: vec![
             crate::runtime::descriptors::EdgePlan {
                 source_node_id: 0,
@@ -1518,6 +2180,7 @@ fn sample_job_plan_bytes(parallelism: u32) -> Vec<u8> {
                 partition: PartitionDescriptor::Forward,
             },
         ],
+        operator_runtime,
     }
     .to_bytes()
     .unwrap()

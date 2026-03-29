@@ -12,6 +12,7 @@ fn frame_type_for_element(element: &StreamElement<Vec<u8>>) -> FrameType {
         StreamElement::Record(_) => FrameType::Data,
         StreamElement::Watermark(_) => FrameType::Watermark,
         StreamElement::CheckpointBarrier(_) => FrameType::Barrier,
+        StreamElement::RescaleBarrier(_) => FrameType::Barrier,
         StreamElement::End => FrameType::End,
     }
 }

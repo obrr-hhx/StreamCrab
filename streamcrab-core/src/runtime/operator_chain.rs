@@ -132,6 +132,21 @@ pub trait Operator<IN>: Send {
         Ok(())
     }
 
+    /// Hook called when a checkpoint barrier is aligned at task level.
+    ///
+    /// Stateful operators can flush write buffers here so snapshot bytes
+    /// are consistent with remote durable state.
+    fn on_checkpoint_barrier(&mut self, _checkpoint_id: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Hook called when a rescale barrier is observed.
+    ///
+    /// Default implementation is a no-op for non-elastic operators.
+    fn on_rescale_barrier(&mut self, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Unified timer callback.
     ///
     /// Runtime should call this API directly. The default implementation routes
@@ -257,6 +272,16 @@ where
     ) -> Result<()> {
         Ok(())
     }
+
+    #[inline(always)]
+    fn on_checkpoint_barrier(&mut self, _checkpoint_id: u64) -> Result<()> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn on_rescale_barrier(&mut self, _generation: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Chain<Head, Tail>: recursive case
@@ -341,6 +366,18 @@ where
         let snapshot: ChainSnapshot = bincode::deserialize(data)?;
         self.head.restore_state(&snapshot.head)?;
         self.tail.restore_state(&snapshot.tail)?;
+        Ok(())
+    }
+
+    fn on_checkpoint_barrier(&mut self, checkpoint_id: u64) -> Result<()> {
+        self.head.on_checkpoint_barrier(checkpoint_id)?;
+        self.tail.on_checkpoint_barrier(checkpoint_id)?;
+        Ok(())
+    }
+
+    fn on_rescale_barrier(&mut self, generation: u64) -> Result<()> {
+        self.head.on_rescale_barrier(generation)?;
+        self.tail.on_rescale_barrier(generation)?;
         Ok(())
     }
 }

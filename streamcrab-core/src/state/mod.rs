@@ -37,10 +37,41 @@
 
 use crate::types::StreamData;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 pub mod hashmap;
+pub mod service;
+pub mod tiered;
+
 pub use hashmap::HashMapStateBackend;
+pub use service::{
+    GrpcStateClient, InMemoryStateClient, StateServiceClient, StateServiceCore,
+    StateServiceCoreConfig, StateServiceHandle, TimerIndexEntry,
+};
+pub use tiered::{TieredStateBackend, TieredStateBackendConfig};
+
+/// Runtime state mode selected by users.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateMode {
+    /// Local in-memory HashMap backend (fastest, not dynamically rescalable).
+    Local,
+    /// Tiered state mode backed by remote StateService.
+    Tiered { state_service: String },
+}
+
+impl Default for StateMode {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+/// Concrete backend kind instantiated for operator execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateBackendKind {
+    LocalHashMap,
+    Tiered,
+}
 
 // ============================================================================
 // State Handles (Descriptors)
@@ -219,9 +250,40 @@ pub trait KeyedStateBackend: Send {
         V: StreamData;
     fn clear_map(&mut self, name: &str) -> Result<()>;
 
+    /// Update current epoch for backend writes.
+    ///
+    /// Local backends can keep the default no-op implementation.
+    fn set_epoch(&mut self, _epoch: u64) {}
+
+    /// Flush pending buffered writes to underlying storage.
+    ///
+    /// Local backends can keep the default no-op implementation.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Trigger a remote copy-on-write snapshot for the given checkpoint epoch.
+    ///
+    /// Local backends can keep the default no-op implementation.
+    fn trigger_remote_snapshot(&mut self, _epoch: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Hook invoked when runtime observes a rescale barrier.
+    ///
+    /// Tiered backends can use this to clear stale cache entries and prefetch
+    /// hot keys for warmup. Local backends can keep the default no-op behavior.
+    fn on_rescale_activate(&mut self, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Snapshot all state for checkpointing.
     fn snapshot(&self) -> Result<Vec<u8>>;
 
     /// Restore state from a checkpoint.
     fn restore(&mut self, data: &[u8]) -> Result<()>;
 }
+
+#[cfg(test)]
+#[path = "tests/state_mode_tests.rs"]
+mod state_mode_tests;

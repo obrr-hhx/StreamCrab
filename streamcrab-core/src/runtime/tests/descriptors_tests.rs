@@ -15,6 +15,7 @@ fn test_job_plan_roundtrip() {
             },
             OperatorDescriptor::Sink {
                 sink_id: "sink".to_string(),
+                guarantee: SinkGuarantee::Idempotent,
             },
         ],
         edges: vec![
@@ -29,6 +30,7 @@ fn test_job_plan_roundtrip() {
                 partition: PartitionDescriptor::Hash,
             },
         ],
+        operator_runtime: vec![],
     };
 
     let bytes = plan.to_bytes().unwrap();

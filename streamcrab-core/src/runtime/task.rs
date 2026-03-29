@@ -270,6 +270,8 @@ where
     }
 
     fn handle_aligned_checkpoint(&mut self, barrier: Barrier) -> Result<()> {
+        self.operator_chain
+            .on_checkpoint_barrier(barrier.checkpoint_id)?;
         let snapshot = self.operator_chain.snapshot_state()?;
         if let Some(sender) = &self.checkpoint_event_sender {
             sender.send(TaskCheckpointEvent::Ack(TaskCheckpointAck {
@@ -333,6 +335,12 @@ where
             StreamElement::CheckpointBarrier(barrier) => {
                 // Non-aligned fallback path (single-input / checkpointing disabled).
                 self.handle_aligned_checkpoint(barrier)?;
+            }
+
+            StreamElement::RescaleBarrier(barrier) => {
+                self.operator_chain.on_rescale_barrier(barrier.generation)?;
+                self.output_gate
+                    .broadcast(StreamElement::RescaleBarrier(barrier))?;
             }
 
             StreamElement::End => {

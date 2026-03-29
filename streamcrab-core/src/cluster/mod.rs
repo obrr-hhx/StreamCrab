@@ -9,6 +9,7 @@ pub mod rpc {
 mod job_manager;
 mod operator_factory;
 mod recovery;
+mod rescale;
 mod scheduler;
 mod task_manager;
 mod types;
@@ -16,6 +17,7 @@ mod types;
 pub use job_manager::*;
 pub use operator_factory::*;
 pub use recovery::*;
+pub use rescale::*;
 pub use scheduler::*;
 pub use task_manager::*;
 pub use types::*;

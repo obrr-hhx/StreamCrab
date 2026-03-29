@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use tokio::net::TcpStream;
@@ -64,12 +64,38 @@ struct PeerIngressState {
     pending_buffer: VecDeque<Frame>,
     // While true, active generation frames must be buffered to preserve switch boundary order.
     pause_active_forwarding: bool,
+    // Per-channel monotonic guard to prevent duplicates/out-of-order replay within a generation.
+    last_sequence_per_channel: HashMap<u32, u64>,
 }
 
 enum PeerFrameAction {
     Forward(Frame),
     Buffered,
     Dropped,
+}
+
+fn is_new_sequence(state: &mut PeerIngressState, frame: &Frame) -> bool {
+    if frame.frame_type != crate::network::FrameType::Data {
+        // Control frames are allowed to overtake data due priority queueing.
+        return true;
+    }
+    if frame.sequence == 0 {
+        // Backward-compatible path for legacy senders that do not attach sequence numbers.
+        return true;
+    }
+    let last = state
+        .last_sequence_per_channel
+        .get(&frame.channel_id)
+        .copied();
+    match last {
+        Some(last_seq) if frame.sequence <= last_seq => false,
+        _ => {
+            state
+                .last_sequence_per_channel
+                .insert(frame.channel_id, frame.sequence);
+            true
+        }
+    }
 }
 
 impl DeployedTaskBridge {
@@ -319,6 +345,7 @@ impl TaskManager {
             state.active_buffer.clear();
             state.pending_buffer.clear();
             state.pause_active_forwarding = false;
+            state.last_sequence_per_channel.clear();
             return generation;
         }
 
@@ -328,6 +355,7 @@ impl TaskManager {
             state.active_generation_pumps = 1;
             state.active_buffer.clear();
             state.pause_active_forwarding = false;
+            state.last_sequence_per_channel.clear();
             return generation;
         }
 
@@ -357,6 +385,9 @@ impl TaskManager {
         };
 
         if state.active_generation == Some(generation) {
+            if !is_new_sequence(state, &frame) {
+                return PeerFrameAction::Dropped;
+            }
             if state.pause_active_forwarding || !state.active_buffer.is_empty() {
                 state.active_buffer.push_back(frame);
                 return PeerFrameAction::Buffered;
@@ -365,6 +396,9 @@ impl TaskManager {
         }
 
         if state.pending_generation == Some(generation) {
+            if !is_new_sequence(state, &frame) {
+                return PeerFrameAction::Dropped;
+            }
             state.pending_buffer.push_back(frame);
             return PeerFrameAction::Buffered;
         }
@@ -397,6 +431,7 @@ impl TaskManager {
                 state.pending_generation_pumps = 0;
                 state.active_buffer = std::mem::take(&mut state.pending_buffer);
                 state.pause_active_forwarding = !state.active_buffer.is_empty();
+                state.last_sequence_per_channel.clear();
                 need_drain = state.pause_active_forwarding;
             }
 
@@ -593,6 +628,9 @@ impl TaskManager {
                 return;
             }
             let mut ended = vec![false; receivers.len()];
+            let mut warmup_remaining = 1000usize;
+            let warmup_interval = Duration::from_millis(10);
+            let mut last_warmup_emit = Instant::now() - warmup_interval;
             loop {
                 let mut progressed = false;
                 for (idx, receiver) in receivers.iter_mut().enumerate() {
@@ -611,6 +649,14 @@ impl TaskManager {
                     progressed = true;
                     if matches!(elem, StreamElement::End) {
                         ended[idx] = true;
+                    }
+                    if warmup_remaining > 0 {
+                        let elapsed = last_warmup_emit.elapsed();
+                        if elapsed < warmup_interval {
+                            tokio::time::sleep(warmup_interval - elapsed).await;
+                        }
+                        last_warmup_emit = Instant::now();
+                        warmup_remaining -= 1;
                     }
                     for (out_idx, peer_tm_id) in output_peer_tms.iter().enumerate() {
                         if let Err(err) = self

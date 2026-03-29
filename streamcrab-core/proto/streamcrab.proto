@@ -10,6 +10,7 @@ service JobManagerService {
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
   rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
   rpc TriggerCheckpoint(TriggerCheckpointRequest) returns (TriggerCheckpointResponse);
+  rpc TriggerRescale(TriggerRescaleRequest) returns (TriggerRescaleResponse);
   rpc ListTaskManagers(ListTaskManagersRequest) returns (ListTaskManagersResponse);
 }
 
@@ -18,6 +19,18 @@ service TaskManagerService {
   rpc CancelTask(CancelTaskRequest) returns (Empty);
   rpc TriggerCheckpoint(CheckpointBarrier) returns (Empty);
   rpc NotifyCheckpointComplete(CheckpointComplete) returns (Empty);
+}
+
+service StateService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  rpc BatchPut(BatchPutRequest) returns (BatchPutResponse);
+  rpc TopKeys(TopKeysRequest) returns (TopKeysResponse);
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse);
+  rpc Seal(SealRequest) returns (SealResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
 }
 
 message Empty {}
@@ -133,6 +146,18 @@ message TriggerCheckpointResponse {
   string message = 3;
 }
 
+message TriggerRescaleRequest {
+  string job_id = 1;
+  uint32 operator_id = 2;
+  uint32 new_parallelism = 3;
+}
+
+message TriggerRescaleResponse {
+  bool accepted = 1;
+  string message = 2;
+  uint64 generation = 3;
+}
+
 message TaskManagerSummary {
   string tm_id = 1;
   string address = 2;
@@ -144,4 +169,96 @@ message ListTaskManagersRequest {}
 
 message ListTaskManagersResponse {
   repeated TaskManagerSummary task_managers = 1;
+}
+
+message StateEntry {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message GetRequest {
+  bytes key = 1;
+  uint64 epoch = 2;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 epoch = 3;
+  string task_id = 4;
+  uint64 seq_no = 5;
+}
+
+message PutResponse {
+  bool accepted = 1;
+}
+
+message BatchGetRequest {
+  repeated bytes keys = 1;
+  uint64 epoch = 2;
+}
+
+message BatchGetItem {
+  bytes key = 1;
+  bool found = 2;
+  bytes value = 3;
+}
+
+message BatchGetResponse {
+  repeated BatchGetItem items = 1;
+}
+
+message BatchPutRequest {
+  repeated StateEntry entries = 1;
+  uint64 epoch = 2;
+  string task_id = 3;
+  uint64 base_seq_no = 4;
+}
+
+message BatchPutResponse {
+  uint32 written = 1;
+}
+
+message TopKeysRequest {
+  uint32 limit = 1;
+  uint64 epoch = 2;
+}
+
+message TopKeysResponse {
+  repeated bytes keys = 1;
+}
+
+message FlushRequest {
+  uint64 epoch = 1;
+}
+
+message FlushResponse {
+  bool accepted = 1;
+}
+
+message TriggerSnapshotRequest {
+  uint64 epoch = 1;
+}
+
+message TriggerSnapshotResponse {
+  bool accepted = 1;
+}
+
+message SealRequest {
+  uint64 epoch = 1;
+}
+
+message SealResponse {
+  bool accepted = 1;
+}
+
+message RollbackRequest {}
+
+message RollbackResponse {
+  bool accepted = 1;
 }

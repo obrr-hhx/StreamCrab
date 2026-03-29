@@ -32,6 +32,7 @@ impl TryFrom<u8> for FrameType {
 pub struct Frame {
     pub frame_type: FrameType,
     pub channel_id: u32,
+    pub sequence: u64,
     pub payload: Vec<u8>,
 }
 
@@ -40,30 +41,41 @@ impl Frame {
         Self {
             frame_type,
             channel_id,
+            sequence: 0,
             payload,
         }
     }
 
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        self.sequence = sequence;
+        self
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let body_len = 1 + 4 + self.payload.len();
+        let body_len = 1 + 4 + 8 + self.payload.len();
         let mut out = Vec::with_capacity(4 + body_len);
         out.extend_from_slice(&(body_len as u32).to_be_bytes());
         out.push(self.frame_type as u8);
         out.extend_from_slice(&self.channel_id.to_be_bytes());
+        out.extend_from_slice(&self.sequence.to_be_bytes());
         out.extend_from_slice(&self.payload);
         out
     }
 
     pub fn decode(body: &[u8]) -> Result<Self> {
-        if body.len() < 5 {
+        if body.len() < 13 {
             return Err(anyhow!("frame body too short: {}", body.len()));
         }
         let frame_type = FrameType::try_from(body[0])?;
         let channel_id = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
+        let sequence = u64::from_be_bytes([
+            body[5], body[6], body[7], body[8], body[9], body[10], body[11], body[12],
+        ]);
         Ok(Self {
             frame_type,
             channel_id,
-            payload: body[5..].to_vec(),
+            sequence,
+            payload: body[13..].to_vec(),
         })
     }
 }

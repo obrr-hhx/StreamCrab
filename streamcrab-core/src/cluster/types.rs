@@ -63,9 +63,30 @@ impl Default for HeartbeatConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub heartbeat: HeartbeatConfig,
+    pub state_service_endpoint: Option<String>,
+    pub autoscaler_interval: Duration,
+    pub autoscaler_cooldown: Duration,
+}
+
+impl ClusterConfig {
+    pub fn with_state_service_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.state_service_endpoint = Some(endpoint.into());
+        self
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat: HeartbeatConfig::default(),
+            state_service_endpoint: None,
+            autoscaler_interval: Duration::from_secs(10),
+            autoscaler_cooldown: Duration::from_secs(60),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +121,8 @@ pub struct TaskManagerInfo {
     pub num_slots: usize,
     pub resources: Resources,
     pub last_heartbeat: Instant,
+    pub last_queue_usage: f64,
+    pub last_throughput: f64,
 }
 
 impl TaskManagerInfo {
@@ -110,11 +133,15 @@ impl TaskManagerInfo {
             num_slots,
             resources,
             last_heartbeat: Instant::now(),
+            last_queue_usage: 0.0,
+            last_throughput: 0.0,
         }
     }
 
-    pub fn heartbeat(&mut self) {
+    pub fn heartbeat(&mut self, queue_usage: u32, throughput: u64) {
         self.last_heartbeat = Instant::now();
+        self.last_queue_usage = (queue_usage as f64 / 100.0).clamp(0.0, 1.0);
+        self.last_throughput = throughput as f64;
     }
 
     pub fn is_alive(&self, timeout: Duration) -> bool {

@@ -135,6 +135,15 @@ where
         Ok(())
     }
 
+    fn rebuild_timer_cache_from_buffers(&mut self) -> Result<()> {
+        self.timer_service = TimerService::new();
+        let map_keys: Vec<(Vec<u8>, TimeWindow)> = self.buffers.keys().cloned().collect();
+        for map_key in map_keys {
+            self.register_event_time_timer(&map_key)?;
+        }
+        Ok(())
+    }
+
     fn apply_trigger_result(
         &mut self,
         map_key: (Vec<u8>, TimeWindow),
@@ -192,6 +201,23 @@ where
         Ok(output)
     }
 
+    /// Handle rescale barrier activation:
+    /// - rebuild timer cache from buffered windows (timer cache is L1 metadata)
+    /// - optionally sync to JM-provided global watermark for immediate timer catch-up
+    pub fn on_rescale_barrier(
+        &mut self,
+        _generation: u64,
+        global_watermark: Option<EventTime>,
+    ) -> Result<Vec<StreamElement<OUT>>> {
+        self.rebuild_timer_cache_from_buffers()?;
+        if let Some(wm) = global_watermark
+            && wm > self.current_watermark
+        {
+            return self.on_timer(wm);
+        }
+        Ok(Vec::new())
+    }
+
     /// Process one stream element and return any window results produced.
     ///
     /// - Records are buffered; output is empty unless a trigger fires immediately.
@@ -235,6 +261,12 @@ where
             }
 
             StreamElement::CheckpointBarrier(b) => Ok(vec![StreamElement::CheckpointBarrier(b)]),
+
+            StreamElement::RescaleBarrier(b) => {
+                let mut output = self.on_rescale_barrier(b.generation, b.global_watermark)?;
+                output.push(StreamElement::RescaleBarrier(b));
+                Ok(output)
+            }
 
             StreamElement::End => Ok(vec![StreamElement::End]),
         }

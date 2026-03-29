@@ -12,6 +12,7 @@ fn test_frame_encode_decode_roundtrip() {
 fn test_frame_decode_rejects_unknown_type() {
     let mut body = vec![99u8];
     body.extend_from_slice(&7u32.to_be_bytes());
+    body.extend_from_slice(&1u64.to_be_bytes());
     body.extend_from_slice(&[1, 2, 3]);
     let err = Frame::decode(&body).unwrap_err();
     assert!(err.to_string().contains("unknown frame type"));

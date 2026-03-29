@@ -17,6 +17,7 @@
 
 pub mod checkpoint;
 pub mod cluster;
+pub mod elastic;
 pub mod graph;
 pub mod network;
 pub mod runtime;

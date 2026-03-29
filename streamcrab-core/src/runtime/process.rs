@@ -275,6 +275,16 @@ where
     fn restore_state(&mut self, data: &[u8]) -> Result<()> {
         self.state_backend.restore(data)
     }
+
+    fn on_checkpoint_barrier(&mut self, checkpoint_id: u64) -> Result<()> {
+        self.state_backend.set_epoch(checkpoint_id);
+        self.state_backend.flush()?;
+        self.state_backend.trigger_remote_snapshot(checkpoint_id)
+    }
+
+    fn on_rescale_barrier(&mut self, generation: u64) -> Result<()> {
+        self.state_backend.on_rescale_activate(generation)
+    }
 }
 
 // ============================================================================
@@ -396,6 +406,16 @@ where
 
     fn restore_state(&mut self, data: &[u8]) -> Result<()> {
         ReduceOperator::restore_state(self, data)
+    }
+
+    fn on_checkpoint_barrier(&mut self, checkpoint_id: u64) -> Result<()> {
+        self.state_backend.set_epoch(checkpoint_id);
+        self.state_backend.flush()?;
+        self.state_backend.trigger_remote_snapshot(checkpoint_id)
+    }
+
+    fn on_rescale_barrier(&mut self, generation: u64) -> Result<()> {
+        self.state_backend.on_rescale_activate(generation)
     }
 }
 

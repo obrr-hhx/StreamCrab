@@ -1,6 +1,8 @@
 use std::sync::mpsc;
 use std::time::Duration;
 use streamcrab_api::environment::StreamExecutionEnvironment;
+use streamcrab_core::elastic::{ElasticConfig, ScalePolicy};
+use streamcrab_core::state::StateMode;
 
 #[test]
 fn test_wordcount() {
@@ -104,6 +106,118 @@ fn test_keyed_sum_with_manual_checkpoints_parallel() {
     assert_eq!(checkpointed.completed_checkpoints, vec![1, 2, 3]);
 }
 
+#[test]
+fn test_keyed_reduce_local_mode_rejects_elastic_config() {
+    let env = StreamExecutionEnvironment::new("keyed-local-reject-elastic");
+    let input = vec![
+        ("user_1".to_string(), 1i32),
+        ("user_1".to_string(), 2),
+        ("user_2".to_string(), 3),
+    ];
+
+    let err = env
+        .from_iter(input)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .with_elastic(ElasticConfig {
+            min_parallelism: 1,
+            max_parallelism: 8,
+            scale_policy: ScalePolicy::Manual,
+            cooldown: Duration::from_secs(60),
+        })
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism(2)
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("requires StateMode::Tiered"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_local_mode_parallelism_change_via_restart_keeps_result() {
+    let env = StreamExecutionEnvironment::new("local-restart-parallelism-change");
+    let input = vec![
+        ("k1".to_string(), 1i32),
+        ("k2".to_string(), 2),
+        ("k1".to_string(), 3),
+        ("k3".to_string(), 4),
+        ("k2".to_string(), 5),
+    ];
+
+    let run_p2 = env
+        .from_iter(input.clone())
+        .key_by(|(k, _): &(String, i32)| k.clone())
+        .reduce(|(k, a), (_, b)| (k, a + b))
+        .execute_with_parallelism(2)
+        .unwrap();
+    let run_p4 = env
+        .from_iter(input)
+        .key_by(|(k, _): &(String, i32)| k.clone())
+        .reduce(|(k, a), (_, b)| (k, a + b))
+        .execute_with_parallelism(4)
+        .unwrap();
+
+    assert_eq!(*run_p2.lock().unwrap(), *run_p4.lock().unwrap());
+}
+
+#[test]
+fn test_keyed_reduce_tiered_mode_matches_local_results() {
+    let env = StreamExecutionEnvironment::new("keyed-tiered-vs-local");
+    let input = vec![
+        ("user_1".to_string(), 10i32),
+        ("user_2".to_string(), 20),
+        ("user_1".to_string(), 15),
+        ("user_3".to_string(), 30),
+        ("user_2".to_string(), 25),
+        ("user_1".to_string(), 5),
+    ];
+
+    let baseline = env
+        .from_iter(input.clone())
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism(2)
+        .unwrap();
+
+    let tiered = env
+        .from_iter(input)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .with_state_mode(StateMode::Tiered {
+            state_service: "in-memory://local".to_string(),
+        })
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism(2)
+        .unwrap();
+
+    assert_eq!(*baseline.lock().unwrap(), *tiered.lock().unwrap());
+}
+
+#[test]
+fn test_keyed_reduce_tiered_mode_checkpoint_flow_completes() {
+    let env = StreamExecutionEnvironment::new("keyed-tiered-checkpoints");
+    let input = vec![
+        ("user_1".to_string(), 10i32),
+        ("user_2".to_string(), 20),
+        ("user_1".to_string(), 15),
+        ("user_3".to_string(), 30),
+        ("user_2".to_string(), 25),
+        ("user_1".to_string(), 5),
+    ];
+
+    let result = env
+        .from_iter(input)
+        .key_by(|(user, _): &(String, i32)| user.clone())
+        .with_state_mode(StateMode::Tiered {
+            state_service: "in-memory://local".to_string(),
+        })
+        .reduce(|(u1, a1), (_, a2)| (u1, a1 + a2))
+        .execute_with_parallelism_and_checkpoints(2, &[0, 3, 6])
+        .unwrap();
+
+    assert_eq!(result.completed_checkpoints, vec![1, 2, 3]);
+}
+
 /// WordCount using flat_map to tokenize lines, then reduce to count words.
 /// This is the canonical stream processing example: lines -> words -> counts.
 #[test]
@@ -193,6 +307,55 @@ fn test_stress_100k_parallelism_8() {
             key, RECORDS_PER_KEY, count
         );
     }
+}
+
+/// Pressure regression: 1,000,000 records with checkpoints enabled.
+///
+/// Validates no data loss and deterministic per-key accumulation under
+/// high record volume in checkpointed parallel execution.
+#[test]
+fn test_stress_1m_parallelism_8_with_checkpoints() {
+    let env = StreamExecutionEnvironment::new("stress-1m-checkpointed");
+
+    const NUM_KEYS: usize = 100;
+    const RECORDS_PER_KEY: i64 = 10_000; // 100 * 10_000 = 1,000,000
+    const TOTAL_RECORDS: usize = (NUM_KEYS as i64 * RECORDS_PER_KEY) as usize;
+
+    let data: Vec<(usize, i64)> = (0..RECORDS_PER_KEY)
+        .flat_map(|_| (0..NUM_KEYS).map(|k| (k, 1i64)))
+        .collect();
+    assert_eq!(data.len(), TOTAL_RECORDS);
+
+    let checkpointed = env
+        .from_iter(data)
+        .key_by(|(k, _): &(usize, i64)| *k)
+        .with_state_mode(StateMode::Tiered {
+            state_service: "in-memory://local".to_string(),
+        })
+        .reduce(|(k, c1), (_, c2)| (k, c1 + c2))
+        .execute_with_parallelism_and_checkpoints(
+            8,
+            &[100_000, 300_000, 500_000, 700_000, 900_000, TOTAL_RECORDS],
+        )
+        .unwrap();
+
+    let final_results = checkpointed.result.lock().unwrap();
+    assert_eq!(final_results.len(), NUM_KEYS);
+    for key in 0..NUM_KEYS {
+        let (_, count) = final_results
+            .get(&key)
+            .unwrap_or_else(|| panic!("key {} is missing from results", key));
+        assert_eq!(
+            *count, RECORDS_PER_KEY,
+            "key {} lost data under 1M stress: expected {}, got {}",
+            key, RECORDS_PER_KEY, count
+        );
+    }
+    assert_eq!(
+        checkpointed.completed_checkpoints.len(),
+        6,
+        "all injected checkpoints should complete"
+    );
 }
 
 /// Chained map + filter + key_by + reduce.

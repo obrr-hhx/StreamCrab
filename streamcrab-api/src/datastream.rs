@@ -4,7 +4,12 @@ use std::sync::{Arc, Mutex};
 use streamcrab_core::checkpoint::{
     CheckpointCoordinator, InMemoryCheckpointStorage, TaskCheckpointAck, TaskCheckpointEvent,
 };
+use streamcrab_core::elastic::ElasticConfig;
 use streamcrab_core::operator_chain::{Append, ChainEnd, FilterOp, FlatMapOp, MapOp, Operator};
+use streamcrab_core::state::{
+    InMemoryStateClient, StateMode, StateServiceCore, StateServiceCoreConfig, TieredStateBackend,
+    TieredStateBackendConfig,
+};
 use streamcrab_core::task::{TaskId, VertexId};
 use streamcrab_core::time::WatermarkStrategy;
 use streamcrab_core::types::{CheckpointId, EventTime, StreamData};
@@ -115,6 +120,8 @@ where
             source_data: self.source_data,
             op_chain: self.op_chain,
             key_fn,
+            state_mode: StateMode::Local,
+            elastic_config: None,
             _phantom: PhantomData,
         }
     }
@@ -1053,6 +1060,8 @@ where
     pub(crate) source_data: Vec<T>,
     pub(crate) op_chain: OpChain,
     pub(crate) key_fn: KeyFn,
+    pub(crate) state_mode: StateMode,
+    pub(crate) elastic_config: Option<ElasticConfig>,
     pub(crate) _phantom: PhantomData<K>,
 }
 
@@ -1064,6 +1073,18 @@ where
     OpChain::OUT: StreamData + Send + Clone + 'static,
     KeyFn: Fn(&OpChain::OUT) -> K + Send + Sync + Clone + 'static,
 {
+    /// Configure backend state mode for keyed operators.
+    pub fn with_state_mode(mut self, mode: StateMode) -> Self {
+        self.state_mode = mode;
+        self
+    }
+
+    /// Configure elastic scaling policy for this keyed stream.
+    pub fn with_elastic(mut self, config: ElasticConfig) -> Self {
+        self.elastic_config = Some(config);
+        self
+    }
+
     /// Reduce elements with the same key by repeatedly applying `reduce_fn` to the
     /// accumulated value and each new element.
     ///
@@ -1077,6 +1098,8 @@ where
             op_chain: self.op_chain,
             key_fn: self.key_fn,
             reduce_fn,
+            state_mode: self.state_mode,
+            elastic_config: self.elastic_config,
             _phantom: PhantomData,
         }
     }
@@ -1095,6 +1118,8 @@ where
     pub(crate) op_chain: OpChain,
     pub(crate) key_fn: KeyFn,
     pub(crate) reduce_fn: ReduceFn,
+    pub(crate) state_mode: StateMode,
+    pub(crate) elastic_config: Option<ElasticConfig>,
     pub(crate) _phantom: PhantomData<K>,
 }
 
@@ -1145,6 +1170,11 @@ where
         if parallelism == 0 {
             return Err(anyhow::anyhow!("parallelism must be greater than 0"));
         }
+        if matches!(self.state_mode, StateMode::Local) && self.elastic_config.is_some() {
+            return Err(anyhow::anyhow!(
+                "elastic scaling requires StateMode::Tiered; Local mode does not support online rescale"
+            ));
+        }
 
         let buffer_size = 1024;
         let results = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -1165,13 +1195,29 @@ where
             parallelism,
             source_senders,
         );
-        let reduce_handles = Self::spawn_reduce_tasks(
-            parallelism,
-            source_receivers,
-            collector_senders,
-            self.key_fn,
-            self.reduce_fn,
-        );
+        let reduce_handles = match &self.state_mode {
+            StateMode::Local => Self::spawn_reduce_tasks_local(
+                parallelism,
+                source_receivers,
+                collector_senders,
+                self.key_fn,
+                self.reduce_fn,
+            ),
+            StateMode::Tiered { .. } => {
+                let core = Arc::new(Mutex::new(StateServiceCore::new(StateServiceCoreConfig {
+                    max_pending_epochs: 1024,
+                    ..StateServiceCoreConfig::default()
+                })));
+                Self::spawn_reduce_tasks_tiered(
+                    parallelism,
+                    source_receivers,
+                    collector_senders,
+                    self.key_fn,
+                    self.reduce_fn,
+                    core,
+                )
+            }
+        };
         let collector_handle =
             Self::spawn_collector_task(collector_receivers, Arc::clone(&results));
 
@@ -1198,6 +1244,11 @@ where
 
         if parallelism == 0 {
             return Err(anyhow::anyhow!("parallelism must be greater than 0"));
+        }
+        if matches!(self.state_mode, StateMode::Local) && self.elastic_config.is_some() {
+            return Err(anyhow::anyhow!(
+                "elastic scaling requires StateMode::Tiered; Local mode does not support online rescale"
+            ));
         }
 
         let buffer_size = 1024;
@@ -1254,14 +1305,31 @@ where
             source_senders,
             checkpoint_plan.clone(),
         );
-        let reduce_handles = Self::spawn_reduce_tasks_with_checkpoints(
-            parallelism,
-            source_receivers,
-            collector_senders,
-            self.key_fn,
-            self.reduce_fn,
-            ack_sender,
-        );
+        let reduce_handles = match &self.state_mode {
+            StateMode::Local => Self::spawn_reduce_tasks_with_checkpoints_local(
+                parallelism,
+                source_receivers,
+                collector_senders,
+                self.key_fn,
+                self.reduce_fn,
+                ack_sender,
+            ),
+            StateMode::Tiered { .. } => {
+                let core = Arc::new(Mutex::new(StateServiceCore::new(StateServiceCoreConfig {
+                    max_pending_epochs: 1024,
+                    ..StateServiceCoreConfig::default()
+                })));
+                Self::spawn_reduce_tasks_with_checkpoints_tiered(
+                    parallelism,
+                    source_receivers,
+                    collector_senders,
+                    self.key_fn,
+                    self.reduce_fn,
+                    ack_sender,
+                    core,
+                )
+            }
+        };
         let collector_handle =
             Self::spawn_collector_task(collector_receivers, Arc::clone(&results));
 
@@ -1411,7 +1479,7 @@ where
         })
     }
 
-    fn spawn_reduce_tasks(
+    fn spawn_reduce_tasks_local(
         parallelism: usize,
         source_receivers: Vec<streamcrab_core::channel::LocalChannelReceiver<OpChain::OUT>>,
         collector_senders: Vec<streamcrab_core::channel::LocalChannelSender<(K, OpChain::OUT)>>,
@@ -1466,7 +1534,7 @@ where
         handles
     }
 
-    fn spawn_reduce_tasks_with_checkpoints(
+    fn spawn_reduce_tasks_with_checkpoints_local(
         parallelism: usize,
         source_receivers: Vec<streamcrab_core::channel::LocalChannelReceiver<OpChain::OUT>>,
         collector_senders: Vec<streamcrab_core::channel::LocalChannelSender<(K, OpChain::OUT)>>,
@@ -1509,6 +1577,143 @@ where
                             }
                         }
                         StreamElement::CheckpointBarrier(barrier) => {
+                            let snapshot =
+                                streamcrab_core::operator_chain::Operator::snapshot_state(
+                                    &operator,
+                                )?;
+                            ack_sender
+                                .send(TaskCheckpointEvent::Ack(TaskCheckpointAck {
+                                    checkpoint_id: barrier.checkpoint_id,
+                                    task_id,
+                                    state: snapshot,
+                                }))
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to send checkpoint ack: {e}")
+                                })?;
+                            sender.send(StreamElement::CheckpointBarrier(barrier))?;
+                        }
+                        StreamElement::End => {
+                            sender.send(StreamElement::End)?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        handles
+    }
+
+    fn spawn_reduce_tasks_tiered(
+        parallelism: usize,
+        source_receivers: Vec<streamcrab_core::channel::LocalChannelReceiver<OpChain::OUT>>,
+        collector_senders: Vec<streamcrab_core::channel::LocalChannelSender<(K, OpChain::OUT)>>,
+        key_fn: KeyFn,
+        reduce_fn: ReduceFn,
+        state_core: Arc<Mutex<StateServiceCore>>,
+    ) -> Vec<std::thread::JoinHandle<anyhow::Result<()>>> {
+        use std::thread;
+        use streamcrab_core::process::ReduceOperator;
+        use streamcrab_core::types::StreamElement;
+
+        let mut handles = Vec::with_capacity(parallelism);
+        let mut receivers_iter = source_receivers.into_iter();
+
+        for sender in collector_senders.into_iter().take(parallelism) {
+            let receiver = receivers_iter.next().unwrap();
+            let key_fn = key_fn.clone();
+            let reduce_fn = reduce_fn.clone();
+            let state_core = Arc::clone(&state_core);
+
+            let handle = thread::spawn(move || -> anyhow::Result<()> {
+                let reducer = FnReduceFunction { reduce_fn };
+                let client = Arc::new(InMemoryStateClient::new(state_core));
+                let backend = TieredStateBackend::new(client, TieredStateBackendConfig::default());
+                let mut operator = ReduceOperator::new(reducer, backend);
+
+                loop {
+                    let element = receiver.recv()?;
+                    match element {
+                        StreamElement::Record(record) => {
+                            let item = record.value;
+                            let key = key_fn(&item);
+                            let input = vec![(key, item)];
+                            let mut output = Vec::new();
+                            operator.process_batch(&input, &mut output)?;
+
+                            for result in output {
+                                sender.send(StreamElement::record(result))?;
+                            }
+                        }
+                        StreamElement::End => {
+                            sender.send(StreamElement::End)?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        handles
+    }
+
+    fn spawn_reduce_tasks_with_checkpoints_tiered(
+        parallelism: usize,
+        source_receivers: Vec<streamcrab_core::channel::LocalChannelReceiver<OpChain::OUT>>,
+        collector_senders: Vec<streamcrab_core::channel::LocalChannelSender<(K, OpChain::OUT)>>,
+        key_fn: KeyFn,
+        reduce_fn: ReduceFn,
+        ack_sender: crossbeam_channel::Sender<TaskCheckpointEvent>,
+        state_core: Arc<Mutex<StateServiceCore>>,
+    ) -> Vec<std::thread::JoinHandle<anyhow::Result<()>>> {
+        use std::thread;
+        use streamcrab_core::process::ReduceOperator;
+        use streamcrab_core::types::StreamElement;
+
+        let mut handles = Vec::with_capacity(parallelism);
+        let mut receivers_iter = source_receivers.into_iter();
+
+        for (subtask, sender) in collector_senders.into_iter().enumerate().take(parallelism) {
+            let receiver = receivers_iter.next().unwrap();
+            let key_fn = key_fn.clone();
+            let reduce_fn = reduce_fn.clone();
+            let ack_sender = ack_sender.clone();
+            let task_id = TaskId::new(VertexId::new(1), subtask);
+            let state_core = Arc::clone(&state_core);
+
+            let handle = thread::spawn(move || -> anyhow::Result<()> {
+                let reducer = FnReduceFunction { reduce_fn };
+                let client = Arc::new(InMemoryStateClient::new(state_core));
+                let backend = TieredStateBackend::new(client, TieredStateBackendConfig::default());
+                let mut operator = ReduceOperator::new(reducer, backend);
+
+                loop {
+                    let element = receiver.recv()?;
+                    match element {
+                        StreamElement::Record(record) => {
+                            let item = record.value;
+                            let key = key_fn(&item);
+                            let input = vec![(key, item)];
+                            let mut output = Vec::new();
+                            operator.process_batch(&input, &mut output)?;
+
+                            for result in output {
+                                sender.send(StreamElement::record(result))?;
+                            }
+                        }
+                        StreamElement::CheckpointBarrier(barrier) => {
+                            streamcrab_core::operator_chain::Operator::on_checkpoint_barrier(
+                                &mut operator,
+                                barrier.checkpoint_id,
+                            )?;
                             let snapshot =
                                 streamcrab_core::operator_chain::Operator::snapshot_state(
                                     &operator,

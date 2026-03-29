@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::elastic::ElasticConfig;
+use crate::state::StateMode;
 use crate::types::NodeId;
 
 /// How data is partitioned between upstream and downstream operators.
@@ -31,6 +33,8 @@ pub struct StreamNode {
     pub id: NodeId,
     pub operator_type: OperatorType,
     pub parallelism: usize,
+    pub state_mode: StateMode,
+    pub elastic_config: Option<ElasticConfig>,
 }
 
 /// An edge connecting two nodes in the DAG.
@@ -65,9 +69,25 @@ impl StreamGraph {
                 id,
                 operator_type,
                 parallelism,
+                state_mode: StateMode::Local,
+                elastic_config: None,
             },
         );
         id
+    }
+
+    /// Update runtime state mode for an existing node.
+    pub fn set_state_mode(&mut self, node_id: NodeId, state_mode: StateMode) {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.state_mode = state_mode;
+        }
+    }
+
+    /// Update elastic policy for an existing node.
+    pub fn set_elastic_config(&mut self, node_id: NodeId, config: Option<ElasticConfig>) {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.elastic_config = config;
+        }
     }
 
     /// Add an edge between two existing nodes.

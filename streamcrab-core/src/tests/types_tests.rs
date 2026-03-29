@@ -46,6 +46,29 @@ fn test_stream_element_barrier_with_timestamp() {
 }
 
 #[test]
+fn test_stream_element_rescale_barrier() {
+    let barrier = RescaleBarrier::new(9, 3, 16, 11, vec![1, 2, 3]);
+    let elem = StreamElement::<i32>::rescale_barrier(barrier.clone());
+    match elem {
+        StreamElement::RescaleBarrier(b) => {
+            assert_eq!(b.checkpoint_id, 9);
+            assert_eq!(b.operator_id, 3);
+            assert_eq!(b.new_parallelism, 16);
+            assert_eq!(b.generation, 11);
+            assert_eq!(b.global_watermark, None);
+            assert_eq!(b.router_state, vec![1, 2, 3]);
+        }
+        _ => panic!("expected RescaleBarrier"),
+    }
+}
+
+#[test]
+fn test_rescale_barrier_with_global_watermark() {
+    let barrier = RescaleBarrier::new(10, 1, 8, 22, vec![]).with_global_watermark(1234);
+    assert_eq!(barrier.global_watermark, Some(1234));
+}
+
+#[test]
 fn test_stream_record_with_timestamp() {
     let rec = StreamRecord::with_timestamp("hello", 999);
     assert_eq!(rec.value, "hello");

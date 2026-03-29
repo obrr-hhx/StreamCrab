@@ -7,6 +7,7 @@ use streamcrab_core::cluster::rpc::job_manager_service_client::JobManagerService
 use streamcrab_core::cluster::{
     ClusterConfig, HeartbeatConfig, JobManager, Resources, TaskManager, rpc,
 };
+use streamcrab_core::state::{StateServiceCoreConfig, StateServiceHandle};
 use tonic::Request;
 
 #[derive(Parser, Debug)]
@@ -55,6 +56,22 @@ enum Commands {
         #[arg(long)]
         job_id: String,
     },
+    TriggerRescale {
+        #[arg(long)]
+        jm: String,
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        operator_id: u32,
+        #[arg(long)]
+        parallelism: u32,
+    },
+    StateService {
+        #[arg(long, default_value = "127.0.0.1:7000")]
+        listen: SocketAddr,
+        #[arg(long, default_value_t = 2)]
+        max_pending_epochs: u64,
+    },
     Status {
         #[arg(long)]
         jm: String,
@@ -81,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
                     interval: Duration::from_millis(heartbeat_interval_ms),
                     timeout: Duration::from_millis(heartbeat_timeout_ms),
                 },
+                state_service_endpoint: None,
+                ..ClusterConfig::default()
             };
             let jm = Arc::new(JobManager::new(config));
             println!("jobmanager listening on {}", listen);
@@ -164,6 +183,37 @@ async fn main() -> anyhow::Result<()> {
                 "trigger checkpoint: accepted={} checkpoint_id={} message={}",
                 response.accepted, response.checkpoint_id, response.message
             );
+        }
+        Commands::TriggerRescale {
+            jm,
+            job_id,
+            operator_id,
+            parallelism,
+        } => {
+            let mut client = JobManagerServiceClient::connect(normalize_endpoint(&jm)).await?;
+            let response = client
+                .trigger_rescale(Request::new(rpc::TriggerRescaleRequest {
+                    job_id,
+                    operator_id,
+                    new_parallelism: parallelism,
+                }))
+                .await?
+                .into_inner();
+            println!(
+                "trigger rescale: accepted={} generation={} message={}",
+                response.accepted, response.generation, response.message
+            );
+        }
+        Commands::StateService {
+            listen,
+            max_pending_epochs,
+        } => {
+            let service = StateServiceHandle::new(StateServiceCoreConfig {
+                max_pending_epochs,
+                ..StateServiceCoreConfig::default()
+            });
+            println!("state-service listening on {}", listen);
+            service.serve(listen).await?;
         }
         Commands::Status { jm, job_id } => {
             let mut client = JobManagerServiceClient::connect(normalize_endpoint(&jm)).await?;

@@ -60,6 +60,42 @@ pub struct Barrier {
     pub timestamp: EventTime,
 }
 
+/// Barrier used for dynamic rescale cutover.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RescaleBarrier {
+    pub checkpoint_id: CheckpointId,
+    pub operator_id: u32,
+    pub new_parallelism: usize,
+    pub generation: u64,
+    #[serde(default)]
+    pub global_watermark: Option<EventTime>,
+    pub router_state: Vec<u8>,
+}
+
+impl RescaleBarrier {
+    pub fn new(
+        checkpoint_id: CheckpointId,
+        operator_id: u32,
+        new_parallelism: usize,
+        generation: u64,
+        router_state: Vec<u8>,
+    ) -> Self {
+        Self {
+            checkpoint_id,
+            operator_id,
+            new_parallelism,
+            generation,
+            global_watermark: None,
+            router_state,
+        }
+    }
+
+    pub fn with_global_watermark(mut self, watermark: EventTime) -> Self {
+        self.global_watermark = Some(watermark);
+        self
+    }
+}
+
 impl Barrier {
     /// Create a new checkpoint barrier with the given ID.
     pub fn new(checkpoint_id: CheckpointId) -> Self {
@@ -88,6 +124,8 @@ pub enum StreamElement<T> {
     Watermark(Watermark),
     /// Checkpoint barrier for exactly-once snapshots.
     CheckpointBarrier(Barrier),
+    /// Rescale barrier for topology cutover.
+    RescaleBarrier(RescaleBarrier),
     /// End of bounded stream.
     End,
 }
@@ -116,6 +154,11 @@ impl<T> StreamElement<T> {
     /// Create a checkpoint barrier element with explicit timestamp.
     pub fn barrier_with_timestamp(checkpoint_id: CheckpointId, timestamp: EventTime) -> Self {
         Self::CheckpointBarrier(Barrier::with_timestamp(checkpoint_id, timestamp))
+    }
+
+    /// Create a rescale barrier element.
+    pub fn rescale_barrier(barrier: RescaleBarrier) -> Self {
+        Self::RescaleBarrier(barrier)
     }
 }
 

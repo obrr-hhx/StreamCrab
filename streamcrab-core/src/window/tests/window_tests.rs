@@ -414,3 +414,33 @@ fn test_window_operator_snapshot_restore() {
         .collect();
     assert_eq!(records, vec![("key".to_string(), 3)]);
 }
+
+#[test]
+fn test_window_operator_rescale_barrier_rebuilds_timer_and_syncs_watermark() {
+    let mut op = make_operator();
+    op.process(StreamElement::timestamped_record(
+        ("key".to_string(), 5i32),
+        1_000,
+    ))
+    .unwrap();
+    assert_eq!(op.buffered_window_count(), 1);
+
+    let barrier =
+        crate::types::RescaleBarrier::new(12, 7, 4, 99, vec![]).with_global_watermark(9_999);
+    let out = op.process(StreamElement::RescaleBarrier(barrier)).unwrap();
+
+    let records: Vec<_> = out
+        .iter()
+        .filter_map(|e| match e {
+            StreamElement::Record(r) => Some(r.value.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(records, vec![("key".to_string(), 5)]);
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, StreamElement::RescaleBarrier(_))),
+        "rescale barrier must be forwarded after local rebuild"
+    );
+    assert_eq!(op.buffered_window_count(), 0);
+}

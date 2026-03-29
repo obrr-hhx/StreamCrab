@@ -31,6 +31,44 @@ async fn test_network_manager_connect_and_send() {
         .unwrap()
         .unwrap();
     assert_eq!(first.channel_id, 3);
+    assert!(first.sequence >= 1);
+}
+
+#[tokio::test]
+async fn test_network_manager_assigns_monotonic_sequence_per_channel() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        TcpConnection::from_stream(stream, 8).await.unwrap()
+    });
+
+    let manager = NetworkManager::new(8);
+    let _client_rx = manager.connect("tm-seq".to_string(), addr).await.unwrap();
+    let (_server_conn, mut server_rx) = server.await.unwrap();
+
+    manager
+        .send_data("tm-seq", Frame::new(FrameType::Data, 42, vec![1]))
+        .await
+        .unwrap();
+    manager
+        .send_data("tm-seq", Frame::new(FrameType::Data, 42, vec![2]))
+        .await
+        .unwrap();
+
+    let first = timeout(Duration::from_secs(1), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = timeout(Duration::from_secs(1), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.channel_id, 42);
+    assert_eq!(second.channel_id, 42);
+    assert!(second.sequence > first.sequence);
 }
 
 #[test]
