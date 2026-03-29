@@ -4,6 +4,8 @@ members = [
     "streamcrab-cli",
     "streamcrab-core",
     "streamcrab-examples",
+    "streamcrab-vectorized",
+    "streamcrab-flink-bridge",
 ]
 resolver = "2"
 

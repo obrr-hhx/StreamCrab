@@ -1,0 +1,32 @@
+[package]
+name = "streamcrab-vectorized"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Velox-inspired vectorized execution engine for StreamCrab"
+
+[dependencies]
+# Arrow columnar format
+arrow = { version = "54", features = ["ffi"] }
+arrow-array = "54"
+arrow-buffer = "54"
+arrow-schema = "54"
+arrow-ipc = "54"
+
+# Core StreamCrab types
+streamcrab-core = { path = "../streamcrab-core" }
+
+# Fast hash
+ahash = { workspace = true }
+
+# Serialization (for state checkpoint)
+serde = { workspace = true }
+bincode = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# For test assertions
+arrow-cast = "54"

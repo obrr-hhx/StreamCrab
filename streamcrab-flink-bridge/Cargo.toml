@@ -1,0 +1,19 @@
+[package]
+name = "streamcrab-flink-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JNI bridge between Apache Flink and StreamCrab vectorized operators"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+streamcrab-vectorized = { path = "../streamcrab-vectorized" }
+jni = "0.21"
+arrow = { version = "54", features = ["ffi"] }
+arrow-array = "54"
+arrow-schema = "54"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
