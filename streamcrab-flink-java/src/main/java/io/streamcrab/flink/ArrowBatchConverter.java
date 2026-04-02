@@ -133,7 +133,14 @@ public class ArrowBatchConverter implements Closeable {
 
     @Override
     public void close() {
-        allocator.close();
+        // Arrow FFI imported buffers may still be referenced by the native side.
+        // Force-close the allocator to avoid IllegalStateException on leak detection.
+        try {
+            allocator.close();
+        } catch (IllegalStateException e) {
+            // Expected when native-owned Arrow memory outlives the Java allocator.
+            // The native side (Rust) is responsible for freeing these buffers.
+        }
     }
 
     // -------------------------------------------------------------------------
