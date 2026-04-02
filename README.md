@@ -139,21 +139,6 @@ JNI Filter E2E:      187.1 M rows/sec
 - Stateful operators: **2-6x** faster
 - Zero GC pauses
 
-## Roadmap
-
-| Phase | Description | Status | Tests |
-|-------|-------------|--------|-------|
-| P0 | Skeleton: DataStream API, StreamGraph, single-thread | ✅ | -- |
-| P1 | Parallel + State: JobGraph, Chaining, KeyedStream | ✅ | -- |
-| P2 | Time + Window: Event Time, Watermark, Timer, 4 Assigners | ✅ | -- |
-| P3 | Checkpoint: Barrier alignment, Snapshot, 2PC Sink | ✅ | -- |
-| P4 | Distributed: gRPC JM/TM, TCP network | ✅ | -- |
-| P5 | WASM: wasmtime Host, Guest SDK, hot update | ✅ | 60 |
-| P6 | Elastic Scaling: Tiered State, Rescale Protocol | ✅ | -- |
-| P7 | Polish: AsyncCall, Kafka, Nexmark, Metrics | ✅ | 70+ |
-| -- | Vectorized Engine + Flink JNI Bridge | ✅ | 101 |
-| **Total** | | | **471** |
-
 ## Features
 
 ### Core Streaming
