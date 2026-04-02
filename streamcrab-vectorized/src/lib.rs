@@ -8,5 +8,6 @@ pub mod expression;
 pub mod hash_table;
 pub mod memory;
 pub mod operators;
+pub mod spill;
 
 pub use batch::VeloxBatch;

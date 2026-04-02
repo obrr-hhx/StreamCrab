@@ -6,6 +6,7 @@
 
 use crate::batch::VeloxBatch;
 use crate::operators::VectorizedOperator;
+use crate::spill::SpillConfig;
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
@@ -155,6 +156,11 @@ struct SnapshotData {
 /// Accumulates rows into per-group accumulators on each `add_input()` call.
 /// `on_watermark()` flushes accumulated state as a single output batch and
 /// resets the hash table, ready for the next window.
+///
+/// Optionally accepts a [`SpillConfig`] via [`with_spill_config`]. When set,
+/// the operator tracks estimated accumulator memory (groups × aggregates × 40
+/// bytes) and spills partial aggregates to disk when the limit is exceeded.
+/// Spilled partial aggregates are merged back into the output during flush.
 pub struct HashAggregateOperator {
     group_by_cols: Vec<usize>,
     aggregates: Vec<AggregateDescriptor>,
@@ -168,6 +174,10 @@ pub struct HashAggregateOperator {
     pending_output: Option<VeloxBatch>,
     finished: bool,
     flush_requested: bool,
+    /// Optional spill configuration.
+    spill_config: Option<SpillConfig>,
+    /// Paths to spill files holding serialized partial [`SnapshotData`].
+    spill_paths: Vec<std::path::PathBuf>,
 }
 
 impl HashAggregateOperator {
@@ -181,7 +191,111 @@ impl HashAggregateOperator {
             pending_output: None,
             finished: false,
             flush_requested: false,
+            spill_config: None,
+            spill_paths: Vec::new(),
         }
+    }
+
+    /// Configure spill-to-disk behavior.
+    ///
+    /// When the estimated accumulator memory (groups × aggregates × 40 bytes)
+    /// exceeds `config.memory_limit_bytes`, partial aggregates are serialized
+    /// and flushed to a spill file. On the next `on_watermark` / flush, all
+    /// spilled partials are read back and merged with the in-memory state before
+    /// emitting the output batch.
+    pub fn with_spill_config(mut self, config: SpillConfig) -> Self {
+        self.spill_config = Some(config);
+        self
+    }
+
+    /// Estimated memory used by accumulators in bytes.
+    ///
+    /// Each [`AccumulatorState`] holds 3 f64s + 1 i64 = 32 bytes; we use 40 to
+    /// account for HashMap overhead and group key storage.
+    fn estimated_accumulator_memory_bytes(&self) -> usize {
+        self.accumulators.len() * self.aggregates.len().max(1) * 40
+    }
+
+    /// Spill current partial aggregates to disk and reset in-memory state.
+    fn maybe_spill_aggregates(&mut self) -> Result<()> {
+        let config = match &self.spill_config {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+
+        if self.estimated_accumulator_memory_bytes() < config.memory_limit_bytes {
+            return Ok(());
+        }
+
+        // Serialize current partial state.
+        let snap = SnapshotData {
+            groups: self.groups.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            accumulators: self.accumulators.clone(),
+            group_keys: self.group_keys.clone(),
+        };
+        let bytes =
+            bincode::serialize(&snap).context("HashAggregateOperator spill: serialize")?;
+
+        let mut spill_mgr = crate::spill::SpillManager::new(config)?;
+        let path = spill_mgr.spill(&bytes)?;
+        self.spill_paths.push(path);
+
+        // Reset in-memory accumulators.
+        self.groups.clear();
+        self.accumulators.clear();
+        self.group_keys.clear();
+
+        // Persist the spill manager so files remain on disk.
+        std::mem::forget(spill_mgr);
+
+        Ok(())
+    }
+
+    /// Merge partial aggregates from a spilled [`SnapshotData`] into current state.
+    fn merge_snapshot(&mut self, snap: SnapshotData) {
+        for (key_bytes, old_idx) in snap.groups {
+            let new_idx = if let Some(&existing) = self.groups.get(&key_bytes) {
+                existing
+            } else {
+                let new_idx = self.accumulators.len();
+                self.accumulators
+                    .push(vec![AccumulatorState::new(); self.aggregates.len()]);
+                self.group_keys.push(snap.group_keys[old_idx].clone());
+                self.groups.insert(key_bytes, new_idx);
+                new_idx
+            };
+            // Merge accumulators from spilled state into current.
+            for agg_idx in 0..self.aggregates.len() {
+                let src = &snap.accumulators[old_idx][agg_idx];
+                let dst = &mut self.accumulators[new_idx][agg_idx];
+                dst.sum += src.sum;
+                dst.count += src.count;
+                if src.min < dst.min {
+                    dst.min = src.min;
+                }
+                if src.max > dst.max {
+                    dst.max = src.max;
+                }
+            }
+        }
+    }
+
+    /// Read back all spill files and merge partial aggregates into current state.
+    fn restore_spilled(&mut self) -> Result<()> {
+        if self.spill_paths.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<_> = self.spill_paths.drain(..).collect();
+        for path in &paths {
+            let bytes = crate::spill::SpillManager::read_spill(path)
+                .context("HashAggregateOperator: read spill file")?;
+            let snap: SnapshotData = bincode::deserialize(&bytes)
+                .context("HashAggregateOperator: deserialize spill")?;
+            self.merge_snapshot(snap);
+            // Clean up file.
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -328,7 +442,13 @@ impl HashAggregateOperator {
     }
 
     /// Flush accumulated state to `pending_output` and reset the hash table.
+    ///
+    /// If spill files exist, their partial aggregates are merged into the
+    /// in-memory state first so the output batch reflects the full dataset.
     fn flush(&mut self) -> Result<()> {
+        // Merge any spilled partial aggregates before emitting.
+        self.restore_spilled()?;
+
         if self.group_keys.is_empty() {
             return Ok(());
         }
@@ -383,6 +503,8 @@ impl VectorizedOperator for HashAggregateOperator {
                 self.accumulators[group_idx][agg_idx].update(v);
             }
         }
+
+        self.maybe_spill_aggregates()?;
 
         if self.flush_requested {
             self.flush()?;
@@ -719,5 +841,42 @@ mod tests {
         assert_eq!(f64_val(&rb, 1, eng_row), 900.0);
         // sales: (250) * 2 = 500
         assert_eq!(f64_val(&rb, 1, sales_row), 500.0);
+    }
+
+    // ── Test 7: HashAggregate accepts SpillConfig ─────────────────────────────
+
+    /// Verify that `with_spill_config` compiles and that aggregation with a
+    /// generous memory limit produces correct results (no actual spill triggered).
+    #[test]
+    fn test_hash_aggregate_with_spill_config() {
+        use crate::spill::SpillConfig;
+
+        let spill_dir = std::env::temp_dir().join("streamcrab-spill-agg-test");
+        let config = SpillConfig {
+            memory_limit_bytes: 64 * 1024 * 1024, // 64 MB — will not trigger for small data
+            spill_dir,
+        };
+
+        let mut op = HashAggregateOperator::new(
+            vec![0], // group by department
+            vec![AggregateDescriptor {
+                function: AggregateFunction::Sum,
+                input_col: 1,
+                output_name: "sum_salary".into(),
+            }],
+        )
+        .with_spill_config(config);
+
+        op.add_input(VeloxBatch::new(dept_salary_batch())).unwrap();
+        let batches = op.on_watermark(0).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let rb = batches[0].inner().clone();
+        assert_eq!(rb.num_rows(), 2, "should still produce 2 groups");
+
+        let eng_row = find_row(&rb, 0, "eng").unwrap();
+        let sales_row = find_row(&rb, 0, "sales").unwrap();
+        assert_eq!(f64_val(&rb, 1, eng_row), 450.0);
+        assert_eq!(f64_val(&rb, 1, sales_row), 250.0);
     }
 }

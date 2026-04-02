@@ -1,5 +1,7 @@
 use super::*;
 use crate::runtime::operator_chain::Operator;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 // ============================================================================
 // Tests: AsyncExternalOperator
@@ -216,4 +218,157 @@ fn test_string_in_string_out() {
         output,
         vec!["hello, world".to_string(), "hello, stream".to_string()]
     );
+}
+
+// ============================================================================
+// Tests: AsyncExternalOperatorV2
+// ============================================================================
+
+/// Helper: build a v2 operator that doubles integers inside a tokio runtime.
+/// Must be called from within a `#[tokio::test]` so `Handle::current()` works.
+fn double_op_v2(
+) -> AsyncExternalOperatorV2<i32, i32, impl Fn(i32) -> std::future::Ready<anyhow::Result<i32>> + Send + Sync + 'static, std::future::Ready<anyhow::Result<i32>>>
+{
+    AsyncExternalOperatorV2::new(
+        |x: i32| std::future::ready(Ok(x * 2)),
+        AsyncCallConfig::default(),
+        tokio::runtime::Handle::current(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_basic_async_call() {
+    let mut op = double_op_v2();
+    let input = vec![1, 2, 3];
+    let mut output = Vec::new();
+
+    op.process_batch(&input, &mut output).unwrap();
+
+    // Order may differ due to concurrent execution; sort before comparing.
+    output.sort_unstable();
+    assert_eq!(output, vec![2, 4, 6]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_concurrent_limit() {
+    // max_concurrent = 2, but we submit 10 tasks — all must still complete.
+    let mut op = AsyncExternalOperatorV2::new(
+        |x: i32| async move { Ok(x * 3) },
+        AsyncCallConfig {
+            max_concurrent: 2,
+            ..AsyncCallConfig::default()
+        },
+        tokio::runtime::Handle::current(),
+    );
+
+    let input: Vec<i32> = (0..10).collect();
+    let mut output = Vec::new();
+    op.process_batch(&input, &mut output).unwrap();
+
+    output.sort_unstable();
+    let expected: Vec<i32> = (0..10).map(|x| x * 3).collect();
+    assert_eq!(output, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_retry_on_failure() {
+    // Async fn that fails on the first attempt and succeeds on the second.
+    let attempt_count = Arc::new(AtomicU32::new(0));
+    let counter = attempt_count.clone();
+
+    let mut op = AsyncExternalOperatorV2::new(
+        move |x: i32| {
+            let c = counter.clone();
+            async move {
+                let prev = c.fetch_add(1, Ordering::SeqCst);
+                if prev == 0 {
+                    anyhow::bail!("transient error")
+                } else {
+                    Ok(x * 5)
+                }
+            }
+        },
+        AsyncCallConfig {
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: std::time::Duration::from_millis(1),
+                max_backoff: std::time::Duration::from_millis(10),
+            },
+            ..AsyncCallConfig::default()
+        },
+        tokio::runtime::Handle::current(),
+    );
+
+    let mut output = Vec::new();
+    op.process_batch(&[4], &mut output).unwrap();
+
+    assert_eq!(output, vec![20]);
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_checkpoint_drain() {
+    // on_checkpoint_barrier is a no-op for v2 (block_on drains all futures).
+    let mut op = double_op_v2();
+
+    // Process some records first.
+    let mut output = Vec::new();
+    op.process_batch(&[1, 2], &mut output).unwrap();
+
+    // Barrier must succeed without error.
+    op.on_checkpoint_barrier(99).unwrap();
+
+    // Processing still works after barrier.
+    let mut output2 = Vec::new();
+    op.process_batch(&[10], &mut output2).unwrap();
+    assert_eq!(output2, vec![20]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_snapshot_restore() {
+    let mut op = double_op_v2();
+
+    let input = vec![1, 2, 3, 4, 5];
+    let mut output = Vec::new();
+    op.process_batch(&input, &mut output).unwrap();
+
+    // Snapshot the state.
+    let snap = op.snapshot_state().unwrap();
+
+    // Restore into a fresh operator and verify processed_count matches.
+    let mut op2 = double_op_v2();
+    op2.restore_state(&snap).unwrap();
+    let snap2 = op2.snapshot_state().unwrap();
+
+    assert_eq!(snap, snap2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_empty_input() {
+    let mut op = double_op_v2();
+    let mut output: Vec<i32> = Vec::new();
+
+    op.process_batch(&[], &mut output).unwrap();
+
+    assert!(output.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v2_error_propagates() {
+    let mut op = AsyncExternalOperatorV2::new(
+        |_x: i32| async move { anyhow::bail!("service down") },
+        AsyncCallConfig {
+            retry: RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            },
+            ..AsyncCallConfig::default()
+        },
+        tokio::runtime::Handle::current(),
+    );
+
+    let mut output: Vec<i32> = Vec::new();
+    let result = op.process_batch(&[1], &mut output);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("service down"));
 }

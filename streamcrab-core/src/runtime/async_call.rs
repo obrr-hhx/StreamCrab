@@ -271,6 +271,203 @@ where
 }
 
 // ============================================================================
+// AsyncExternalOperatorV2 — true async execution via tokio + FuturesUnordered
+// ============================================================================
+
+/// Async helper: call `f(input)` with exponential-backoff retry.
+///
+/// This is a free async function so it can be called from within spawned tasks
+/// without capturing `self`. Retry logic mirrors the v1 synchronous version.
+async fn call_with_retry<IN, OUT, F, Fut>(
+    f: &F,
+    input: IN,
+    retry: &RetryPolicy,
+) -> Result<OUT>
+where
+    IN: Clone,
+    F: Fn(IN) -> Fut,
+    Fut: std::future::Future<Output = Result<OUT>>,
+{
+    let mut attempts = 0u32;
+    let mut backoff = retry.initial_backoff;
+
+    loop {
+        match f(input.clone()).await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= retry.max_attempts {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(retry.max_backoff);
+            }
+        }
+    }
+}
+
+/// Async version of the external call operator.
+///
+/// Uses a tokio runtime to execute async calls with bounded concurrency
+/// enforced via a [`tokio::sync::Semaphore`]. All calls within a single
+/// `process_batch` invocation are dispatched concurrently up to `max_concurrent`
+/// in-flight at once, then collected via [`futures::stream::FuturesUnordered`].
+///
+/// ## Type Parameters
+///
+/// - `IN`: Input record type (`Send + Clone + 'static`).
+/// - `OUT`: Output record type (`Send + 'static`).
+/// - `F`: Async call function `Fn(IN) -> Fut`.
+/// - `Fut`: The future returned by `F`.
+///
+/// ## Checkpoint Behavior
+///
+/// Because `process_batch` uses `runtime.block_on(...)`, all in-flight futures
+/// complete before the method returns. Therefore `on_checkpoint_barrier` is a
+/// no-op — there are never pending requests at barrier time.
+///
+/// ## At-Least-Once Semantics
+///
+/// Same as v1: recovery replays from the last checkpoint. The external service
+/// must be idempotent.
+pub struct AsyncExternalOperatorV2<IN, OUT, F, Fut>
+where
+    IN: Send + 'static,
+    OUT: Send + 'static,
+    F: Fn(IN) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<OUT>> + Send + 'static,
+{
+    call_fn: std::sync::Arc<F>,
+    config: AsyncCallConfig,
+    /// Semaphore limiting concurrent in-flight requests to `config.max_concurrent`.
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Handle to the tokio runtime used to drive async tasks from the sync `process_batch`.
+    runtime: tokio::runtime::Handle,
+    /// Total records successfully processed (snapshot/restore + observability).
+    processed_count: u64,
+    _phantom: std::marker::PhantomData<(IN, OUT, Fut)>,
+}
+
+impl<IN, OUT, F, Fut> AsyncExternalOperatorV2<IN, OUT, F, Fut>
+where
+    IN: Send + 'static,
+    OUT: Send + 'static,
+    F: Fn(IN) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<OUT>> + Send + 'static,
+{
+    /// Create a new v2 operator.
+    ///
+    /// # Arguments
+    ///
+    /// - `call_fn`: Async function invoked for each record. Must be idempotent.
+    /// - `config`: Controls concurrency, timeout, and retry behavior.
+    /// - `runtime`: Handle to the tokio runtime used to execute async tasks.
+    ///   In production use `tokio::runtime::Handle::current()`; in `#[tokio::test]`
+    ///   the test macro provides an implicit runtime so `Handle::current()` works there too.
+    pub fn new(call_fn: F, config: AsyncCallConfig, runtime: tokio::runtime::Handle) -> Self {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
+        Self {
+            call_fn: std::sync::Arc::new(call_fn),
+            config,
+            semaphore,
+            runtime,
+            processed_count: 0,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<IN, OUT, F, Fut> Operator<IN> for AsyncExternalOperatorV2<IN, OUT, F, Fut>
+where
+    IN: Send + Clone + 'static,
+    OUT: Send + 'static,
+    F: Fn(IN) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<OUT>> + Send + 'static,
+{
+    type OUT = OUT;
+
+    /// Process a batch by dispatching each record as a concurrent async task.
+    ///
+    /// Up to `config.max_concurrent` tasks run simultaneously; the rest wait on
+    /// the semaphore. All tasks are collected before the method returns, so there
+    /// are no in-flight requests after this call completes.
+    fn process_batch(&mut self, input: &[IN], output: &mut Vec<OUT>) -> Result<()> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let call_fn = self.call_fn.clone();
+        let semaphore = self.semaphore.clone();
+        let config = self.config.clone();
+        let inputs: Vec<IN> = input.to_vec();
+        let count = inputs.len() as u64;
+
+        // `block_in_place` parks the current thread for blocking work without
+        // blocking the tokio scheduler. Inside it we use the stored Handle to
+        // `block_on` the async collection, which is safe because `block_in_place`
+        // first moves the thread out of the async executor context.
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                let mut futures: FuturesUnordered<_> = inputs
+                    .into_iter()
+                    .map(|item| {
+                        let fn_ref = call_fn.clone();
+                        let sem = semaphore.clone();
+                        let retry = config.retry.clone();
+                        tokio::spawn(async move {
+                            // Acquire permit before calling; released when `_permit` drops.
+                            let _permit = sem.acquire().await.map_err(|e| {
+                                anyhow::anyhow!("semaphore closed: {e}")
+                            })?;
+                            call_with_retry(&*fn_ref, item, &retry).await
+                        })
+                    })
+                    .collect();
+
+                while let Some(join_result) = futures.next().await {
+                    match join_result {
+                        Ok(Ok(out)) => output.push(out),
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(anyhow::anyhow!("task panicked: {e}")),
+                    }
+                }
+                Ok(())
+            })
+        })?;
+
+        self.processed_count += count;
+        Ok(())
+    }
+
+    /// Snapshot operator state for checkpoint.
+    ///
+    /// Stores `processed_count`. All in-flight calls have already completed by
+    /// the time this is invoked (because `process_batch` uses `block_on`).
+    fn snapshot_state(&self) -> Result<Vec<u8>> {
+        let snap = AsyncCallSnapshot {
+            processed_count: self.processed_count,
+        };
+        let bytes = bincode::serialize(&snap)
+            .map_err(|e| anyhow::anyhow!("snapshot serialize error: {e}"))?;
+        Ok(bytes)
+    }
+
+    /// Restore operator state from a checkpoint snapshot.
+    fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let snap: AsyncCallSnapshot = bincode::deserialize(data)
+            .map_err(|e| anyhow::anyhow!("snapshot deserialize error: {e}"))?;
+        self.processed_count = snap.processed_count;
+        Ok(())
+    }
+
+    /// No-op: all in-flight requests are drained by `process_batch` before it returns.
+    fn on_checkpoint_barrier(&mut self, _checkpoint_id: u64) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
