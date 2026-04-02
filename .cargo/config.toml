@@ -1,2 +1,10 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[target.wasm32-unknown-unknown]
+# Don't apply native CPU flags to WASM targets
+rustflags = []
+
+[target.wasm32-wasi]
+# Don't apply native CPU flags to WASM targets
+rustflags = []

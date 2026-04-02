@@ -128,9 +128,7 @@ impl<S: CheckpointStorage> CheckpointCoordinator<S> {
             if let Some(pending) = pending_guard.get(&checkpoint_id) {
                 if !pending.expected_tasks.contains(&task_id) {
                     return Err(anyhow!(
-                        "task {} is not expected for checkpoint {}",
-                        task_id,
-                        checkpoint_id
+                        "task {task_id} is not expected for checkpoint {checkpoint_id}"
                     ));
                 }
             } else {

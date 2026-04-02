@@ -1,0 +1,18 @@
+[package]
+name = "streamcrab-wasm-guest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "StreamCrab Guest SDK for WASM UDFs — compile with --target wasm32-unknown-unknown"
+
+# Empty [workspace] prevents Cargo from pulling this crate into the root workspace.
+# This crate is intentionally standalone: it must be compiled separately with
+# --target wasm32-unknown-unknown so it carries no host-only dependencies.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"

@@ -8,14 +8,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
+use streamcrab_vectorized::VeloxBatch;
+use streamcrab_vectorized::expression::eval::{col, eq, gt, lit_f64, lit_i64, lt, mul};
+use streamcrab_vectorized::operators::VectorizedOperator;
 use streamcrab_vectorized::operators::{
     AggregateDescriptor, AggregateFunction, FilterOperator, HashAggregateOperator,
     HashJoinOperator, JoinType, ProjectOperator, Projection, WindowAggFunction,
     WindowAggregateDescriptor, WindowAggregateOperator, WindowType,
 };
-use streamcrab_vectorized::operators::VectorizedOperator;
-use streamcrab_vectorized::expression::eval::{col, eq, gt, lit_f64, lit_i64, lt, mul};
-use streamcrab_vectorized::VeloxBatch;
 
 // ── Data generation helpers ──────────────────────────────────────────────────
 
@@ -194,11 +194,7 @@ fn test_nexmark_q2_filter_auction() {
 
     assert_eq!(rb.num_rows(), 10, "only rows 0..9 should pass the filter");
 
-    let ids = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let ids = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     for i in 0..rb.num_rows() {
         assert!(
             ids.value(i) < 10,
@@ -225,7 +221,7 @@ fn test_nexmark_q5_window_aggregation() {
 
     let mut op = WindowAggregateOperator::new(
         WindowType::Tumbling { size_ms: 1000 },
-        1, // event_time col
+        1,       // event_time col
         vec![0], // partition by auction_id
         vec![WindowAggregateDescriptor {
             function: WindowAggFunction::Count,
@@ -243,16 +239,16 @@ fn test_nexmark_q5_window_aggregation() {
         let batches = op.on_watermark(watermark).unwrap();
         for batch in &batches {
             let rb = batch.inner();
-            assert!(rb.num_rows() > 0, "fired window at wm={} must have rows", watermark);
+            assert!(
+                rb.num_rows() > 0,
+                "fired window at wm={} must have rows",
+                watermark
+            );
 
             // col 0 = part_0 (auction_id, Int64)
             // col 1 = bid_count (Int64, Count returns Int64)
             // col 2 = window_start, col 3 = window_end
-            let counts = rb
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let counts = rb.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..rb.num_rows() {
                 let c = counts.value(i);
                 assert!(c > 0, "count must be positive, got {} at row {}", c, i);
@@ -268,7 +264,10 @@ fn test_nexmark_q5_window_aggregation() {
         "sum of all window counts must equal total input rows ({} vs {})",
         total_count_sum, N
     );
-    assert!(total_window_rows > 0, "at least some window result rows must have been produced");
+    assert!(
+        total_window_rows > 0,
+        "at least some window result rows must have been produced"
+    );
 }
 
 // ── Test 4: Nexmark Q8 — join persons with auctions ──────────────────────────
@@ -305,11 +304,7 @@ fn test_nexmark_q8_join() {
 
         // Output schema: build cols (person_id, name) ++ probe cols (auction_id, seller_id)
         // Verify name column (col 1 from build side) is non-null strings
-        let names = rb
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let names = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         for i in 0..rb.num_rows() {
             assert!(
                 !names.is_null(i),
@@ -391,12 +386,22 @@ fn test_pipeline_filter_then_aggregate() {
 
     // Output schema: group_0 (Utf8), sum_amount (Float64), cnt (Float64)
     let dept_col = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let sum_col = rb.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-    let cnt_col = rb.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let sum_col = rb
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let cnt_col = rb
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
 
     for row in 0..rb.num_rows() {
         let dept_name = dept_col.value(row);
-        let dept_idx = depts.iter().position(|&d| d == dept_name)
+        let dept_idx = depts
+            .iter()
+            .position(|&d| d == dept_name)
             .expect("dept name should be one of the 5 known departments");
         let actual_sum = sum_col.value(row);
         let actual_cnt = cnt_col.value(row) as usize;
@@ -481,8 +486,16 @@ fn test_checkpoint_restore_full_pipeline() {
     assert_eq!(rb.num_rows(), 1, "single group expected");
 
     // sum(0..99) = 99*100/2 = 4950
-    let sum_col = rb.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-    let cnt_col = rb.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let sum_col = rb
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let cnt_col = rb
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     let actual_sum = sum_col.value(0);
     let actual_cnt = cnt_col.value(0) as i64;
 
@@ -550,7 +563,11 @@ fn test_large_batch_performance() {
     assert_eq!(rb.num_columns(), 2);
 
     // Spot-check: last row's value_doubled should be (N-1)*2
-    let doubled = rb.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+    let doubled = rb
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     let expected_last = (N as f64 - 1.0) * 2.0;
     assert!(
         (doubled.value(N - 1) - expected_last).abs() < 1e-6,

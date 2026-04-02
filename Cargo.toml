@@ -6,6 +6,7 @@ members = [
     "streamcrab-examples",
     "streamcrab-vectorized",
     "streamcrab-flink-bridge",
+    "streamcrab-wasm",
 ]
 resolver = "2"
 
@@ -40,3 +41,4 @@ crossbeam-channel = "0.5"
 # Internal crates
 streamcrab-api = { path = "streamcrab-api" }
 streamcrab-core = { path = "streamcrab-core" }
+streamcrab-wasm = { path = "streamcrab-wasm" }

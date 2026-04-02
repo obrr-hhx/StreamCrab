@@ -106,7 +106,7 @@ fn build_agg_descriptor(
         "min" => AggregateFunction::Min,
         "max" => AggregateFunction::Max,
         "avg" => AggregateFunction::Avg,
-        other => anyhow::bail!("unknown aggregate function: {}", other),
+        other => anyhow::bail!("unknown aggregate function: {other}"),
     };
     Ok(streamcrab_vectorized::operators::AggregateDescriptor {
         function,
@@ -124,13 +124,15 @@ fn build_window_agg_descriptor(
         "count" => WindowAggFunction::Count,
         "min" => WindowAggFunction::Min,
         "max" => WindowAggFunction::Max,
-        other => anyhow::bail!("unknown window aggregate function: {}", other),
+        other => anyhow::bail!("unknown window aggregate function: {other}"),
     };
-    Ok(streamcrab_vectorized::operators::WindowAggregateDescriptor {
-        function,
-        input_col: cfg.input_col,
-        output_name: cfg.output_name.clone(),
-    })
+    Ok(
+        streamcrab_vectorized::operators::WindowAggregateDescriptor {
+            function,
+            input_col: cfg.input_col,
+            output_name: cfg.output_name.clone(),
+        },
+    )
 }
 
 fn build_predicate(
@@ -160,7 +162,7 @@ fn create_operator(
     };
 
     let cfg: OperatorConfig = serde_json::from_slice(config_json)
-        .map_err(|e| anyhow::anyhow!("invalid operator config JSON: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("invalid operator config JSON: {e}"))?;
 
     match cfg {
         OperatorConfig::Filter(fc) => {
@@ -173,7 +175,10 @@ fn create_operator(
                 .iter()
                 .map(build_agg_descriptor)
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(Box::new(HashAggregateOperator::new(hac.group_by_cols, aggregates)))
+            Ok(Box::new(HashAggregateOperator::new(
+                hac.group_by_cols,
+                aggregates,
+            )))
         }
         OperatorConfig::HashJoin(hjc) => {
             let join_type = match hjc.join_type.to_lowercase().as_str() {
@@ -395,19 +400,15 @@ pub extern "C" fn Java_io_streamcrab_flink_NativeOperator_freeArrowResult(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use streamcrab_vectorized::VeloxBatch;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+    use streamcrab_vectorized::VeloxBatch;
 
     fn int64_batch(values: Vec<i64>) -> VeloxBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let rb = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(values))],
-        )
-        .unwrap();
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
         VeloxBatch::new(rb)
     }
 
@@ -479,7 +480,10 @@ mod tests {
                 None => Ok(0i64),
                 Some(out) => {
                     let (sp, ap) = arrow_ffi::export_batch(&out)?;
-                    let r = Box::new(ArrowResult { schema_ptr: sp, array_ptr: ap });
+                    let r = Box::new(ArrowResult {
+                        schema_ptr: sp,
+                        array_ptr: ap,
+                    });
                     Ok(Box::into_raw(r) as i64)
                 }
             }
@@ -530,7 +534,10 @@ mod tests {
 
         handle_map::with_operator(h, |op| op.add_input(batch)).unwrap();
         let snap = handle_map::with_operator(h, |op| op.snapshot_state()).unwrap();
-        assert!(!snap.is_empty(), "non-empty agg should produce non-empty snapshot");
+        assert!(
+            !snap.is_empty(),
+            "non-empty agg should produce non-empty snapshot"
+        );
 
         // Create a fresh operator and restore.
         let op2 = create_operator(json).unwrap();

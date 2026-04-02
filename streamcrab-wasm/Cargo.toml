@@ -1,0 +1,15 @@
+[package]
+name = "streamcrab-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wasmtime = "27"
+
+streamcrab-core = { workspace = true }

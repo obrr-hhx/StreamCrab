@@ -18,6 +18,7 @@ use std::collections::HashMap;
 /// Uses descriptor pattern: state handles don't borrow the backend,
 /// avoiding borrow-checker conflicts.
 #[derive(Debug, Default)]
+#[allow(clippy::type_complexity)]
 pub struct HashMapStateBackend {
     /// Value states: (key, state_name) -> value_bytes
     value_states: HashMap<(Vec<u8>, String), Vec<u8>>,
@@ -43,6 +44,7 @@ impl HashMapStateBackend {
 
 /// Snapshot container for checkpointing.
 #[derive(Serialize, Deserialize)]
+#[allow(clippy::type_complexity)]
 struct SnapshotData {
     value_states: HashMap<(Vec<u8>, String), Vec<u8>>,
     list_states: HashMap<(Vec<u8>, String), Vec<Vec<u8>>>,
@@ -124,7 +126,7 @@ impl KeyedStateBackend for HashMapStateBackend {
 
         self.list_states
             .entry(state_key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(bytes);
         Ok(())
     }
@@ -179,7 +181,7 @@ impl KeyedStateBackend for HashMapStateBackend {
 
         self.map_states
             .entry(state_key)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(kbytes, vbytes);
         Ok(())
     }
@@ -225,12 +227,12 @@ impl KeyedStateBackend for HashMapStateBackend {
             list_states: self.list_states.clone(),
             map_states: self.map_states.clone(),
         };
-        Ok(bincode::serialize(&data).map_err(|e| anyhow!("Snapshot failed: {}", e))?)
+        bincode::serialize(&data).map_err(|e| anyhow!("Snapshot failed: {e}"))
     }
 
     fn restore(&mut self, data: &[u8]) -> Result<()> {
         let snap: SnapshotData =
-            bincode::deserialize(data).map_err(|e| anyhow!("Restore failed: {}", e))?;
+            bincode::deserialize(data).map_err(|e| anyhow!("Restore failed: {e}"))?;
         self.value_states = snap.value_states;
         self.list_states = snap.list_states;
         self.map_states = snap.map_states;

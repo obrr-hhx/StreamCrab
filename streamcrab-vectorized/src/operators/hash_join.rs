@@ -215,11 +215,7 @@ impl HashJoinOperator {
     ///
     /// All output fields are marked nullable because outer joins can pad
     /// either side with nulls.
-    fn ensure_output_schema_from_schemas(
-        &mut self,
-        build_schema: &Schema,
-        probe_schema: &Schema,
-    ) {
+    fn ensure_output_schema_from_schemas(&mut self, build_schema: &Schema, probe_schema: &Schema) {
         if self.output_schema.is_none() {
             let fields: Vec<Field> = build_schema
                 .fields()
@@ -271,7 +267,11 @@ impl HashJoinOperator {
         for col_idx in 0..num_probe_cols {
             let probe_col = probe_batch.column(col_idx);
             let probe_rows: Vec<usize> = pairs.iter().map(|&(_, _, _, pr)| pr).collect();
-            let arr = gather_column(probe_col, &probe_rows, schema.field(num_build_cols + col_idx).data_type())?;
+            let arr = gather_column(
+                probe_col,
+                &probe_rows,
+                schema.field(num_build_cols + col_idx).data_type(),
+            )?;
             columns.push(arr);
         }
 
@@ -389,7 +389,9 @@ impl HashJoinOperator {
 
 impl VectorizedOperator for HashJoinOperator {
     fn add_input(&mut self, batch: VeloxBatch) -> Result<()> {
-        let rb = batch.materialize().context("HashJoinOperator: materialize input")?;
+        let rb = batch
+            .materialize()
+            .context("HashJoinOperator: materialize input")?;
 
         match self.phase {
             JoinPhase::Build => {
@@ -404,11 +406,8 @@ impl VectorizedOperator for HashJoinOperator {
                     self.ensure_output_schema_from_schemas(&build_schema, &rb.schema());
                 }
 
-                let key_cols: Vec<&ArrayRef> = self
-                    .probe_key_cols
-                    .iter()
-                    .map(|&i| rb.column(i))
-                    .collect();
+                let key_cols: Vec<&ArrayRef> =
+                    self.probe_key_cols.iter().map(|&i| rb.column(i)).collect();
 
                 let mut matched_pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
                 let mut unmatched_probe: Vec<usize> = Vec::new();
@@ -494,8 +493,8 @@ impl VectorizedOperator for HashJoinOperator {
 
         for (batch_idx, ipc_bytes) in snapshot.build_batches_ipc.iter().enumerate() {
             let cursor = Cursor::new(ipc_bytes.as_slice());
-            let mut reader =
-                StreamReader::try_new(cursor, None).context("HashJoinOperator restore: IPC reader")?;
+            let mut reader = StreamReader::try_new(cursor, None)
+                .context("HashJoinOperator restore: IPC reader")?;
             let batch = reader
                 .next()
                 .context("HashJoinOperator restore: missing batch in IPC stream")?
@@ -604,7 +603,7 @@ fn gather_column_mixed(
             }
             Ok(Arc::new(b.finish()))
         }
-        other => anyhow::bail!("HashJoinOperator: unsupported column type {:?}", other),
+        other => anyhow::bail!("HashJoinOperator: unsupported column type {other:?}"),
     }
 }
 
@@ -745,12 +744,10 @@ mod tests {
         let mut names: Vec<String> = batches
             .iter()
             .flat_map(|b| {
-                let arr = b
-                    .column(4)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+                let arr = b.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
             })
             .collect();
         names.sort_unstable();
@@ -771,14 +768,21 @@ mod tests {
         op.finish_probe().unwrap();
 
         let batches = drain_output(&mut op);
-        assert_eq!(total_rows(&batches), 4, "expected 4 rows (3 matched + 1 unmatched build)");
+        assert_eq!(
+            total_rows(&batches),
+            4,
+            "expected 4 rows (3 matched + 1 unmatched build)"
+        );
 
         // The unmatched build row should have null for the name column (col 4).
         let has_null_name = batches.iter().any(|b| {
             let arr = b.column(4).as_any().downcast_ref::<StringArray>().unwrap();
             (0..arr.len()).any(|i| arr.is_null(i))
         });
-        assert!(has_null_name, "expected at least one null name for unmatched build row");
+        assert!(
+            has_null_name,
+            "expected at least one null name for unmatched build row"
+        );
 
         // order_id=4 (customer_id=300) should appear.
         let order_ids: Vec<i64> = batches
@@ -792,7 +796,10 @@ mod tests {
                     .to_vec()
             })
             .collect();
-        assert!(order_ids.contains(&4), "order_id=4 must appear in left join output");
+        assert!(
+            order_ids.contains(&4),
+            "order_id=4 must appear in left join output"
+        );
     }
 
     // ── Test 3: Right join ────────────────────────────────────────────────────
@@ -809,7 +816,11 @@ mod tests {
         op.finish_probe().unwrap();
 
         let batches = drain_output(&mut op);
-        assert_eq!(total_rows(&batches), 4, "expected 4 rows (3 matched + 1 unmatched probe)");
+        assert_eq!(
+            total_rows(&batches),
+            4,
+            "expected 4 rows (3 matched + 1 unmatched probe)"
+        );
 
         // "Dave" row should appear with null order_id (col 0).
         let has_dave = batches.iter().any(|b| {
@@ -817,7 +828,10 @@ mod tests {
             let order_ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             (0..names.len()).any(|i| names.value(i) == "Dave" && order_ids.is_null(i))
         });
-        assert!(has_dave, "Dave must appear with null order_id in right join");
+        assert!(
+            has_dave,
+            "Dave must appear with null order_id in right join"
+        );
     }
 
     // ── Test 4: Multiple matches ──────────────────────────────────────────────
@@ -848,7 +862,11 @@ mod tests {
         op.finish_probe().unwrap();
 
         let batches = drain_output(&mut op);
-        assert_eq!(total_rows(&batches), 2, "customer_id=100 matches 2 build rows");
+        assert_eq!(
+            total_rows(&batches),
+            2,
+            "customer_id=100 matches 2 build rows"
+        );
 
         let mut order_ids: Vec<i64> = batches
             .iter()
@@ -883,7 +901,11 @@ mod tests {
         op2.finish_probe().unwrap();
 
         let batches = drain_output(&mut op2);
-        assert_eq!(total_rows(&batches), 3, "restored operator must produce same 3 matched rows");
+        assert_eq!(
+            total_rows(&batches),
+            3,
+            "restored operator must produce same 3 matched rows"
+        );
 
         let mut order_ids: Vec<i64> = batches
             .iter()

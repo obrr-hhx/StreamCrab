@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 ..ClusterConfig::default()
             };
             let jm = Arc::new(JobManager::new(config));
-            println!("jobmanager listening on {}", listen);
+            println!("jobmanager listening on {listen}");
             jm.serve(listen).await?;
         }
         Commands::Taskmanager {
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
                 Resources::default(),
                 heartbeat,
             ));
-            println!("taskmanager listening on {}", listen);
+            println!("taskmanager listening on {listen}");
             let serve_handle = tokio::spawn({
                 let tm = Arc::clone(&tm);
                 async move { tm.serve(listen).await }
@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 max_pending_epochs,
                 ..StateServiceCoreConfig::default()
             });
-            println!("state-service listening on {}", listen);
+            println!("state-service listening on {listen}");
             service.serve(listen).await?;
         }
         Commands::Status { jm, job_id } => {
@@ -248,6 +248,6 @@ fn normalize_endpoint(input: &str) -> String {
     if input.starts_with("http://") || input.starts_with("https://") {
         input.to_string()
     } else {
-        format!("http://{}", input)
+        format!("http://{input}")
     }
 }

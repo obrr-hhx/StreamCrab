@@ -10,7 +10,7 @@
 use crate::batch::VeloxBatch;
 use crate::operators::VectorizedOperator;
 use ahash::AHashMap;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -183,19 +183,20 @@ impl TypedAggBuffer {
             WindowAggFunction::Sum => self.floats.push(acc.0),
             WindowAggFunction::Count => self.ints.push(acc.1),
             WindowAggFunction::Min => {
-                self.floats.push(if acc.2 == f64::INFINITY { 0.0 } else { acc.2 })
+                self.floats
+                    .push(if acc.2 == f64::INFINITY { 0.0 } else { acc.2 })
             }
-            WindowAggFunction::Max => {
-                self.floats.push(if acc.3 == f64::NEG_INFINITY { 0.0 } else { acc.3 })
-            }
+            WindowAggFunction::Max => self.floats.push(if acc.3 == f64::NEG_INFINITY {
+                0.0
+            } else {
+                acc.3
+            }),
         }
     }
 
     fn finish(self) -> (ArrayRef, DataType) {
         match self.func {
-            WindowAggFunction::Count => {
-                (Arc::new(Int64Array::from(self.ints)), DataType::Int64)
-            }
+            WindowAggFunction::Count => (Arc::new(Int64Array::from(self.ints)), DataType::Int64),
             _ => (Arc::new(Float64Array::from(self.floats)), DataType::Float64),
         }
     }
@@ -381,7 +382,7 @@ impl WindowAggregateOperator {
 
         for (i, builder) in part_builders.into_iter().enumerate() {
             let dtype = builder.data_type();
-            fields.push(Field::new(format!("part_{}", i), dtype, true));
+            fields.push(Field::new(format!("part_{i}"), dtype, true));
             columns.push(builder.finish());
         }
 
@@ -407,16 +408,16 @@ impl WindowAggregateOperator {
 
 impl VectorizedOperator for WindowAggregateOperator {
     fn add_input(&mut self, batch: VeloxBatch) -> Result<()> {
-        let rb = batch.materialize().context("WindowAggregateOperator: materialize")?;
+        let rb = batch
+            .materialize()
+            .context("WindowAggregateOperator: materialize")?;
         let num_rows = rb.num_rows();
 
         let time_col = rb
             .column(self.event_time_col)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                anyhow!("event_time column {} is not Int64", self.event_time_col)
-            })?;
+            .ok_or_else(|| anyhow!("event_time column {} is not Int64", self.event_time_col))?;
 
         let part_cols: Vec<ArrayRef> = self
             .partition_cols
@@ -458,8 +459,7 @@ impl VectorizedOperator for WindowAggregateOperator {
                     if col.is_null(row) {
                         continue; // NULL inputs are ignored (SQL semantics).
                     }
-                    let value: f64 = if let Some(arr) =
-                        col.as_any().downcast_ref::<Float64Array>()
+                    let value: f64 = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>()
                     {
                         arr.value(row)
                     } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
@@ -510,16 +510,20 @@ impl VectorizedOperator for WindowAggregateOperator {
 
     fn snapshot_state(&self) -> Result<Vec<u8>> {
         let state = CheckpointState {
-            windows: self.windows.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            windows: self
+                .windows
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             current_watermark: self.current_watermark,
             window_type: self.window_type.clone(),
         };
-        bincode::serialize(&state).map_err(|e| anyhow!("snapshot_state: {}", e))
+        bincode::serialize(&state).map_err(|e| anyhow!("snapshot_state: {e}"))
     }
 
     fn restore_state(&mut self, data: &[u8]) -> Result<()> {
         let state: CheckpointState =
-            bincode::deserialize(data).map_err(|e| anyhow!("restore_state: {}", e))?;
+            bincode::deserialize(data).map_err(|e| anyhow!("restore_state: {e}"))?;
         self.windows = state.windows.into_iter().collect();
         self.current_watermark = state.current_watermark;
         self.window_type = state.window_type;
@@ -578,11 +582,22 @@ mod tests {
         let n = rb.num_rows();
         // Columns: part_0 (Utf8), sum_value (Float64), window_start (Int64), window_end (Int64)
         let users = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let sums = rb.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let sums = rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let ws = rb.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let we = rb.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
         let mut rows: Vec<(String, f64, i64, i64)> = (0..n)
-            .map(|i| (users.value(i).to_owned(), sums.value(i), ws.value(i), we.value(i)))
+            .map(|i| {
+                (
+                    users.value(i).to_owned(),
+                    sums.value(i),
+                    ws.value(i),
+                    we.value(i),
+                )
+            })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
         rows
@@ -612,7 +627,11 @@ mod tests {
         assert_eq!(rb.num_rows(), 1);
         let rows = collect_rows_sum(rb);
         assert_eq!(rows[0].0, "alice");
-        assert!((rows[0].1 - 6.0).abs() < 1e-10, "sum should be 6.0, got {}", rows[0].1);
+        assert!(
+            (rows[0].1 - 6.0).abs() < 1e-10,
+            "sum should be 6.0, got {}",
+            rows[0].1
+        );
         assert_eq!(rows[0].2, 0);
         assert_eq!(rows[0].3, 1000);
     }
@@ -651,7 +670,10 @@ mod tests {
     fn test_sliding_event_in_multiple_windows() {
         // size=1000ms, slide=500ms → event at t=700 falls in [0,1000) and [500,1500).
         let mut op = WindowAggregateOperator::new(
-            WindowType::Sliding { size_ms: 1000, slide_ms: 500 },
+            WindowType::Sliding {
+                size_ms: 1000,
+                slide_ms: 500,
+            },
             1,
             vec![0],
             vec![WindowAggregateDescriptor {
@@ -664,7 +686,11 @@ mod tests {
         op.add_input(make_batch(&[("alice", 700, 1.0)])).unwrap();
 
         // Both windows should be active.
-        assert_eq!(op.windows.len(), 2, "event at 700 should open 2 sliding windows");
+        assert_eq!(
+            op.windows.len(),
+            2,
+            "event at 700 should open 2 sliding windows"
+        );
 
         // Watermark 1000 fires [0,1000).
         let out = op.on_watermark(1000).unwrap();
@@ -716,7 +742,8 @@ mod tests {
     fn test_checkpoint_restore() {
         let mut op = sum_op();
 
-        op.add_input(make_batch(&[("alice", 100, 1.0), ("alice", 500, 2.0)])).unwrap();
+        op.add_input(make_batch(&[("alice", 100, 1.0), ("alice", 500, 2.0)]))
+            .unwrap();
 
         let snap = op.snapshot_state().unwrap();
 
@@ -724,7 +751,11 @@ mod tests {
         let mut op2 = sum_op();
         op2.restore_state(&snap).unwrap();
 
-        assert_eq!(op.windows.len(), op2.windows.len(), "window count must match after restore");
+        assert_eq!(
+            op.windows.len(),
+            op2.windows.len(),
+            "window count must match after restore"
+        );
 
         let out = op2.on_watermark(1000).unwrap();
         assert_eq!(out.len(), 1);
@@ -744,7 +775,11 @@ mod tests {
 
         // Late event for the already-fired window.
         op.add_input(make_batch(&[("alice", 200, 99.0)])).unwrap();
-        assert_eq!(op.windows.len(), 0, "late event must not reopen a flushed window");
+        assert_eq!(
+            op.windows.len(),
+            0,
+            "late event must not reopen a flushed window"
+        );
 
         let out = op.on_watermark(2000).unwrap();
         assert!(out.is_empty());
@@ -783,8 +818,16 @@ mod tests {
         assert_eq!(out.len(), 1);
         let rb = out[0].inner();
         // Columns: part_0, min_v, max_v, window_start, window_end
-        let min_col = rb.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let max_col = rb.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let min_col = rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let max_col = rb
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((min_col.value(0) - 1.0).abs() < 1e-10, "min should be 1.0");
         assert!((max_col.value(0) - 9.0).abs() < 1e-10, "max should be 9.0");
     }

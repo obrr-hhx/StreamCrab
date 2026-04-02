@@ -1,10 +1,13 @@
 //! Runtime-domain modules: task loop, operators, partitioning, and execution helpers.
 
+pub mod async_call;
 pub mod core;
 pub mod descriptors;
+pub mod metrics;
 pub mod operator_chain;
 pub mod partitioner;
 pub mod process;
+pub mod shutdown;
 pub mod task;
 
 pub use core::*;

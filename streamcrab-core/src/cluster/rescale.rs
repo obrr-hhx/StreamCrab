@@ -193,9 +193,7 @@ impl RescaleCoordinator {
         let session = self.session_mut(job_id, generation)?;
         if matches!(session.phase, RescalePhase::S6Activated) {
             return Err(anyhow!(
-                "job {} generation {} is already activated",
-                job_id,
-                generation
+                "job {job_id} generation {generation} is already activated"
             ));
         }
         session.phase = RescalePhase::Failed;
@@ -220,7 +218,7 @@ impl RescaleCoordinator {
         let session = self
             .sessions_by_job
             .get_mut(job_id)
-            .ok_or_else(|| anyhow!("job {} has no active rescale session", job_id))?;
+            .ok_or_else(|| anyhow!("job {job_id} has no active rescale session"))?;
         if session.generation != generation {
             return Err(anyhow!(
                 "job {} generation mismatch: expected {}, got {}",
@@ -258,11 +256,7 @@ fn ensure_phase(
         return Ok(());
     }
     Err(anyhow!(
-        "job {} generation {} cannot {} from phase {:?}",
-        job_id,
-        generation,
-        action,
-        current
+        "job {job_id} generation {generation} cannot {action} from phase {current:?}"
     ))
 }
 

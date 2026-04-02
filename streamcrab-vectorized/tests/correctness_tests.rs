@@ -10,13 +10,13 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use streamcrab_vectorized::VeloxBatch;
+use streamcrab_vectorized::expression::eval::{add, col, gt, lit_f64, mul};
 use streamcrab_vectorized::operators::{
     AggregateDescriptor, AggregateFunction, FilterOperator, HashAggregateOperator,
-    HashJoinOperator, JoinType, ProjectOperator, Projection, VectorizedOperator,
-    WindowAggFunction, WindowAggregateDescriptor, WindowAggregateOperator, WindowType,
+    HashJoinOperator, JoinType, ProjectOperator, Projection, VectorizedOperator, WindowAggFunction,
+    WindowAggregateDescriptor, WindowAggregateOperator, WindowType,
 };
-use streamcrab_vectorized::expression::eval::{add, col, gt, lit_f64, mul};
-use streamcrab_vectorized::VeloxBatch;
 
 const EPSILON: f64 = 1e-10;
 
@@ -100,11 +100,31 @@ fn test_aggregation_correctness_exact() {
     let mut op = HashAggregateOperator::new(
         vec![0], // group by department
         vec![
-            AggregateDescriptor { function: AggregateFunction::Sum,   input_col: 1, output_name: "sum_sal".into()   },
-            AggregateDescriptor { function: AggregateFunction::Count, input_col: 1, output_name: "cnt".into()       },
-            AggregateDescriptor { function: AggregateFunction::Min,   input_col: 1, output_name: "min_sal".into()   },
-            AggregateDescriptor { function: AggregateFunction::Max,   input_col: 1, output_name: "max_sal".into()   },
-            AggregateDescriptor { function: AggregateFunction::Avg,   input_col: 1, output_name: "avg_sal".into()   },
+            AggregateDescriptor {
+                function: AggregateFunction::Sum,
+                input_col: 1,
+                output_name: "sum_sal".into(),
+            },
+            AggregateDescriptor {
+                function: AggregateFunction::Count,
+                input_col: 1,
+                output_name: "cnt".into(),
+            },
+            AggregateDescriptor {
+                function: AggregateFunction::Min,
+                input_col: 1,
+                output_name: "min_sal".into(),
+            },
+            AggregateDescriptor {
+                function: AggregateFunction::Max,
+                input_col: 1,
+                output_name: "max_sal".into(),
+            },
+            AggregateDescriptor {
+                function: AggregateFunction::Avg,
+                input_col: 1,
+                output_name: "avg_sal".into(),
+            },
         ],
     );
     op.add_input(VeloxBatch::new(rb)).unwrap();
@@ -118,11 +138,11 @@ fn test_aggregation_correctness_exact() {
 
     // Schema: group_0 (Utf8), sum_sal, cnt, min_sal, max_sal, avg_sal
     let dept_col = str_col(out, 0);
-    let sum_col  = f64_col(out, 1);
-    let cnt_col  = f64_col(out, 2); // Count is stored as f64 by HashAggregateOperator
-    let min_col  = f64_col(out, 3);
-    let max_col  = f64_col(out, 4);
-    let avg_col  = f64_col(out, 5);
+    let sum_col = f64_col(out, 1);
+    let cnt_col = f64_col(out, 2); // Count is stored as f64 by HashAggregateOperator
+    let min_col = f64_col(out, 3);
+    let max_col = f64_col(out, 4);
+    let avg_col = f64_col(out, 5);
 
     for row in 0..out.num_rows() {
         let name = dept_col.value(row);
@@ -134,28 +154,38 @@ fn test_aggregation_correctness_exact() {
         assert!(
             (sum_col.value(row) - expected_sum[d]).abs() < EPSILON,
             "dept {}: sum expected {}, got {}",
-            name, expected_sum[d], sum_col.value(row)
+            name,
+            expected_sum[d],
+            sum_col.value(row)
         );
         assert_eq!(
             cnt_col.value(row) as i64,
             expected_count[d],
             "dept {}: count expected {}, got {}",
-            name, expected_count[d], cnt_col.value(row)
+            name,
+            expected_count[d],
+            cnt_col.value(row)
         );
         assert!(
             (min_col.value(row) - expected_min[d]).abs() < EPSILON,
             "dept {}: min expected {}, got {}",
-            name, expected_min[d], min_col.value(row)
+            name,
+            expected_min[d],
+            min_col.value(row)
         );
         assert!(
             (max_col.value(row) - expected_max[d]).abs() < EPSILON,
             "dept {}: max expected {}, got {}",
-            name, expected_max[d], max_col.value(row)
+            name,
+            expected_max[d],
+            max_col.value(row)
         );
         assert!(
             (avg_col.value(row) - expected_avg[d]).abs() < EPSILON,
             "dept {}: avg expected {}, got {}",
-            name, expected_avg[d], avg_col.value(row)
+            name,
+            expected_avg[d],
+            avg_col.value(row)
         );
     }
 }
@@ -181,7 +211,9 @@ fn test_join_correctness_exact() {
         Field::new("name", DataType::Utf8, false),
     ]));
     let cust_ids: Vec<i64> = (0..NUM_CUSTOMERS as i64).collect();
-    let cust_names: Vec<String> = (0..NUM_CUSTOMERS).map(|i| format!("customer_{}", i)).collect();
+    let cust_names: Vec<String> = (0..NUM_CUSTOMERS)
+        .map(|i| format!("customer_{}", i))
+        .collect();
     let cust_names_ref: Vec<&str> = cust_names.iter().map(String::as_str).collect();
     let customers = RecordBatch::try_new(
         cust_schema,
@@ -199,7 +231,9 @@ fn test_join_correctness_exact() {
         Field::new("amount", DataType::Float64, false),
     ]));
     let order_ids: Vec<i64> = (0..NUM_ORDERS as i64).collect();
-    let order_cids: Vec<i64> = (0..NUM_ORDERS as i64).map(|i| i % NUM_CUSTOMERS as i64).collect();
+    let order_cids: Vec<i64> = (0..NUM_ORDERS as i64)
+        .map(|i| i % NUM_CUSTOMERS as i64)
+        .collect();
     let order_amounts: Vec<f64> = (0..NUM_ORDERS).map(|i| i as f64).collect();
     let orders = RecordBatch::try_new(
         order_schema,
@@ -224,31 +258,37 @@ fn test_join_correctness_exact() {
     while let Some(batch) = op.get_output().unwrap() {
         let rb = batch.materialize().unwrap();
         // Output schema: [customer_id(build), name(build), order_id(probe), customer_id(probe), amount(probe)]
-        let name_col   = str_col(&rb, 1);
-        let probe_cid  = i64_col(&rb, 3);
+        let name_col = str_col(&rb, 1);
+        let probe_cid = i64_col(&rb, 3);
         let amount_col = f64_col(&rb, 4);
 
         for row in 0..rb.num_rows() {
             let cid = probe_cid.value(row);
             let expected_name = format!("customer_{}", cid);
             assert_eq!(
-                name_col.value(row), expected_name.as_str(),
+                name_col.value(row),
+                expected_name.as_str(),
                 "row {}: name mismatch for customer_id {}",
-                row, cid
+                row,
+                cid
             );
             total_amount += amount_col.value(row);
         }
         total_rows += rb.num_rows();
     }
 
-    assert_eq!(total_rows, NUM_ORDERS,
-        "inner join must produce exactly {} rows, got {}", NUM_ORDERS, total_rows);
+    assert_eq!(
+        total_rows, NUM_ORDERS,
+        "inner join must produce exactly {} rows, got {}",
+        NUM_ORDERS, total_rows
+    );
 
     let expected_total_amount: f64 = order_amounts.iter().sum();
     assert!(
         (total_amount - expected_total_amount).abs() < EPSILON,
         "total amount: expected {}, got {}",
-        expected_total_amount, total_amount
+        expected_total_amount,
+        total_amount
     );
 
     // LEFT join: 1000 original customers + 100 extra with no matching orders.
@@ -283,8 +323,13 @@ fn test_join_correctness_exact() {
     }
 
     // 5000 matched rows + 100 unmatched build rows = 5100
-    assert_eq!(left_total, NUM_ORDERS + NUM_EXTRA,
-        "left join must produce {} rows, got {}", NUM_ORDERS + NUM_EXTRA, left_total);
+    assert_eq!(
+        left_total,
+        NUM_ORDERS + NUM_EXTRA,
+        "left join must produce {} rows, got {}",
+        NUM_ORDERS + NUM_EXTRA,
+        left_total
+    );
 }
 
 // ── test_window_correctness_exact ────────────────────────────────────────────
@@ -334,7 +379,7 @@ fn test_window_correctness_exact() {
 
     let mut op = WindowAggregateOperator::new(
         WindowType::Tumbling { size_ms: WINDOW_MS },
-        1, // event_time col
+        1,       // event_time col
         vec![0], // partition by user_id
         vec![
             WindowAggregateDescriptor {
@@ -356,40 +401,69 @@ fn test_window_correctness_exact() {
         let watermark = (w as i64 + 1) * WINDOW_MS;
         let batches = op.on_watermark(watermark).unwrap();
 
-        assert_eq!(batches.len(), 1,
-            "window {} (wm={}) must produce exactly 1 batch", w, watermark);
+        assert_eq!(
+            batches.len(),
+            1,
+            "window {} (wm={}) must produce exactly 1 batch",
+            w,
+            watermark
+        );
 
         let out = batches[0].inner();
 
         // Each window must have exactly NUM_USERS rows (one per user).
-        assert_eq!(out.num_rows(), NUM_USERS,
-            "window {}: expected {} rows, got {}", w, NUM_USERS, out.num_rows());
+        assert_eq!(
+            out.num_rows(),
+            NUM_USERS,
+            "window {}: expected {} rows, got {}",
+            w,
+            NUM_USERS,
+            out.num_rows()
+        );
 
         // Schema: [part_0(user_id:Int64), sum_val(Float64), cnt(Int64), window_start, window_end]
-        let user_col  = i64_col(out, 0);
-        let sum_col   = f64_col(out, 1);
+        let user_col = i64_col(out, 0);
+        let sum_col = f64_col(out, 1);
         // Count returns Int64Array
-        let cnt_col   = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cnt_col = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let wstart_col = i64_col(out, 3);
-        let wend_col   = i64_col(out, 4);
+        let wend_col = i64_col(out, 4);
 
         for row in 0..out.num_rows() {
             let uid = user_col.value(row) as usize;
             let expected_w_start = w as i64 * WINDOW_MS;
-            let expected_w_end   = expected_w_start + WINDOW_MS;
+            let expected_w_end = expected_w_start + WINDOW_MS;
 
-            assert_eq!(wstart_col.value(row), expected_w_start,
-                "window {} user {}: wrong window_start", w, uid);
-            assert_eq!(wend_col.value(row), expected_w_end,
-                "window {} user {}: wrong window_end", w, uid);
+            assert_eq!(
+                wstart_col.value(row),
+                expected_w_start,
+                "window {} user {}: wrong window_start",
+                w,
+                uid
+            );
+            assert_eq!(
+                wend_col.value(row),
+                expected_w_end,
+                "window {} user {}: wrong window_end",
+                w,
+                uid
+            );
             assert!(
                 (sum_col.value(row) - expected_sum[w][uid]).abs() < EPSILON,
                 "window {} user {}: sum expected {}, got {}",
-                w, uid, expected_sum[w][uid], sum_col.value(row)
+                w,
+                uid,
+                expected_sum[w][uid],
+                sum_col.value(row)
             );
-            assert_eq!(cnt_col.value(row), expected_count[w][uid],
+            assert_eq!(
+                cnt_col.value(row),
+                expected_count[w][uid],
                 "window {} user {}: count expected {}, got {}",
-                w, uid, expected_count[w][uid], cnt_col.value(row)
+                w,
+                uid,
+                expected_count[w][uid],
+                cnt_col.value(row)
             );
         }
     }
@@ -447,25 +521,32 @@ fn test_filter_project_correctness() {
 
     // id > 50000 means ids 50001..99999 → exactly 49999 rows.
     let expected_rows = 49999usize;
-    assert_eq!(out.num_rows(), expected_rows,
-        "expected {} rows after filter, got {}", expected_rows, out.num_rows());
+    assert_eq!(
+        out.num_rows(),
+        expected_rows,
+        "expected {} rows after filter, got {}",
+        expected_rows,
+        out.num_rows()
+    );
 
-    let id_col       = i64_col(&out, 0);
+    let id_col = i64_col(&out, 0);
     let computed_col = f64_col(&out, 1);
 
     for row in 0..out.num_rows() {
         let id = id_col.value(row);
 
         // Every id must be > 50000
-        assert!(id > 50000,
-            "row {}: id {} should be > 50000", row, id);
+        assert!(id > 50000, "row {}: id {} should be > 50000", row, id);
 
         // computed_col = id * 1.5 * 2.0 + 1.0 = id * 3.0 + 1.0
         let expected_computed = id as f64 * 3.0 + 1.0;
         assert!(
             (computed_col.value(row) - expected_computed).abs() < EPSILON,
             "row {} (id={}): computed_col expected {}, got {}",
-            row, id, expected_computed, computed_col.value(row)
+            row,
+            id,
+            expected_computed,
+            computed_col.value(row)
         );
     }
 
@@ -473,8 +554,11 @@ fn test_filter_project_correctness() {
     let id_set: std::collections::HashSet<i64> =
         (0..out.num_rows()).map(|i| id_col.value(i)).collect();
     for expected_id in 50001i64..100000 {
-        assert!(id_set.contains(&expected_id),
-            "id {} missing from output", expected_id);
+        assert!(
+            id_set.contains(&expected_id),
+            "id {} missing from output",
+            expected_id
+        );
     }
 }
 
@@ -538,8 +622,11 @@ fn test_sliding_window_correctness() {
     }
 
     let mut op = WindowAggregateOperator::new(
-        WindowType::Sliding { size_ms: SIZE_MS, slide_ms: SLIDE_MS },
-        1, // event_time col
+        WindowType::Sliding {
+            size_ms: SIZE_MS,
+            slide_ms: SLIDE_MS,
+        },
+        1,       // event_time col
         vec![0], // partition by 'partition' col
         vec![
             WindowAggregateDescriptor {
@@ -568,22 +655,31 @@ fn test_sliding_window_correctness() {
     for batch in &batches {
         let rb = batch.inner();
         // Schema: [part_0(Int64), sum_val(Float64), cnt(Int64), window_start, window_end]
-        let sum_col    = f64_col(rb, 1);
-        let cnt_col    = rb.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sum_col = f64_col(rb, 1);
+        let cnt_col = rb.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let wstart_col = i64_col(rb, 3);
-        let wend_col   = i64_col(rb, 4);
+        let wend_col = i64_col(rb, 4);
 
         for row in 0..rb.num_rows() {
             let ws = wstart_col.value(row);
             let we = wend_col.value(row);
-            assert_eq!(we - ws, SIZE_MS,
-                "window size must be {}ms, got ws={} we={}", SIZE_MS, ws, we);
+            assert_eq!(
+                we - ws,
+                SIZE_MS,
+                "window size must be {}ms, got ws={} we={}",
+                SIZE_MS,
+                ws,
+                we
+            );
             actual.insert(ws, (sum_col.value(row), cnt_col.value(row)));
         }
         total_output_rows += rb.num_rows();
     }
 
-    assert!(total_output_rows > 0, "must produce at least one output row");
+    assert!(
+        total_output_rows > 0,
+        "must produce at least one output row"
+    );
 
     // Verify every expected window that should have fired (start + SIZE_MS <= 5000).
     for (&ws, &(exp_sum, exp_cnt)) in &expected {
@@ -591,15 +687,21 @@ fn test_sliding_window_correctness() {
             // Window not yet complete at watermark=5000.
             continue;
         }
-        let (act_sum, act_cnt) = *actual.get(&ws).unwrap_or_else(|| {
-            panic!("expected window start={} not found in output", ws)
-        });
+        let (act_sum, act_cnt) = *actual
+            .get(&ws)
+            .unwrap_or_else(|| panic!("expected window start={} not found in output", ws));
         assert!(
             (act_sum - exp_sum).abs() < EPSILON,
-            "window start={}: sum expected {}, got {}", ws, exp_sum, act_sum
+            "window start={}: sum expected {}, got {}",
+            ws,
+            exp_sum,
+            act_sum
         );
-        assert_eq!(act_cnt, exp_cnt,
-            "window start={}: count expected {}, got {}", ws, exp_cnt, act_cnt);
+        assert_eq!(
+            act_cnt, exp_cnt,
+            "window start={}: count expected {}, got {}",
+            ws, exp_cnt, act_cnt
+        );
     }
 
     // Verify no spurious extra windows.
@@ -607,11 +709,17 @@ fn test_sliding_window_correctness() {
         // Window starts may be negative (e.g. [-500,1500) covers t=0..999).
         // They must be aligned to SLIDE_MS.
         assert_eq!(
-            ws.rem_euclid(SLIDE_MS), 0,
-            "spurious window start={} not aligned to slide_ms={}", ws, SLIDE_MS
+            ws.rem_euclid(SLIDE_MS),
+            0,
+            "spurious window start={} not aligned to slide_ms={}",
+            ws,
+            SLIDE_MS
         );
         // Every output window must have a corresponding expected entry.
-        assert!(expected.contains_key(&ws),
-            "output window start={} has no expected entry (no events?)", ws);
+        assert!(
+            expected.contains_key(&ws),
+            "output window start={} has no expected entry (no events?)",
+            ws
+        );
     }
 }

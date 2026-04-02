@@ -5,10 +5,10 @@
 //! back to the concrete Rust operator.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use streamcrab_vectorized::operators::VectorizedOperator;
 
 // ── Global state ──────────────────────────────────────────────────────────────
@@ -18,8 +18,7 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// Global operator registry.  `Option` allows lazy initialisation without
 /// `OnceLock` — the `None` state is replaced with `Some(HashMap::new())` on
 /// first access.
-static HANDLE_MAP: Mutex<Option<HashMap<u64, Box<dyn VectorizedOperator>>>> =
-    Mutex::new(None);
+static HANDLE_MAP: Mutex<Option<HashMap<u64, Box<dyn VectorizedOperator>>>> = Mutex::new(None);
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -57,7 +56,7 @@ where
     let map = guard.as_mut().unwrap();
     let op = map
         .get_mut(&handle)
-        .ok_or_else(|| anyhow!("unknown operator handle: {}", handle))?;
+        .ok_or_else(|| anyhow!("unknown operator handle: {handle}"))?;
     f(op.as_mut())
 }
 
@@ -67,10 +66,7 @@ where
 mod tests {
     use super::*;
     use anyhow::Result;
-    use streamcrab_vectorized::{
-        batch::VeloxBatch,
-        operators::VectorizedOperator,
-    };
+    use streamcrab_vectorized::{batch::VeloxBatch, operators::VectorizedOperator};
 
     /// A trivial no-op operator used for handle map tests.
     struct NoopOperator;
@@ -148,7 +144,10 @@ mod tests {
         let state = with_operator(h, |op| op.snapshot_state()).unwrap();
         // HashAggregateOperator always serializes its struct fields, so the
         // snapshot is non-empty even with zero groups.
-        assert!(!state.is_empty(), "snapshot_state should produce serialized bytes");
+        assert!(
+            !state.is_empty(),
+            "snapshot_state should produce serialized bytes"
+        );
         let _ = remove(h);
     }
 }

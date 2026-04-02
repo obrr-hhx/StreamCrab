@@ -3,8 +3,8 @@
 //! Provides a lightweight memory accounting layer so the JNI bridge can report
 //! native memory usage back to Flink's memory manager.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Tracks memory allocated by native vectorized operators.
 #[derive(Debug, Clone)]

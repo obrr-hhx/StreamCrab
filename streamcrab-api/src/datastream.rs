@@ -1085,6 +1085,28 @@ where
         self
     }
 
+    /// Process elements through a WASM UDF.
+    ///
+    /// `wasm_bytes` is a compiled WASM module (or WAT text for testing).
+    /// `config` overrides the default [`WasmRuntimeConfig`]; pass `None` to use defaults.
+    ///
+    /// Returns a [`WasmJob`] that can be executed with [`execute_with_parallelism`](WasmJob::execute_with_parallelism).
+    pub fn process_wasm(
+        self,
+        wasm_bytes: Vec<u8>,
+        config: Option<streamcrab_wasm::runtime::WasmRuntimeConfig>,
+    ) -> WasmJob<K, T, OpChain, KeyFn> {
+        WasmJob {
+            source_data: self.source_data,
+            op_chain: self.op_chain,
+            key_fn: self.key_fn,
+            wasm_bytes,
+            wasm_config: config.unwrap_or_default(),
+            state_mode: self.state_mode,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Reduce elements with the same key by repeatedly applying `reduce_fn` to the
     /// accumulated value and each new element.
     ///
@@ -1784,5 +1806,76 @@ where
         handle
             .join()
             .map_err(|_| anyhow::anyhow!("{name} thread panicked"))?
+    }
+}
+
+// =============================================================================
+// WasmJob
+// =============================================================================
+
+/// A job that processes elements through a WASM UDF.
+///
+/// Created by calling [`KeyedStream::process_wasm`].
+/// Execute with [`execute_with_parallelism`](Self::execute_with_parallelism).
+pub struct WasmJob<K, T, OpChain, KeyFn>
+where
+    K: StreamData + Send + 'static,
+    T: StreamData + Send + 'static,
+{
+    pub(crate) source_data: Vec<T>,
+    pub(crate) op_chain: OpChain,
+    #[allow(dead_code)]
+    pub(crate) key_fn: KeyFn,
+    pub(crate) wasm_bytes: Vec<u8>,
+    pub(crate) wasm_config: streamcrab_wasm::runtime::WasmRuntimeConfig,
+    #[allow(dead_code)]
+    pub(crate) state_mode: StateMode,
+    pub(crate) _phantom: PhantomData<K>,
+}
+
+impl<K, T, OpChain, KeyFn> WasmJob<K, T, OpChain, KeyFn>
+where
+    K: StreamData + Send + Sync + std::fmt::Debug + std::hash::Hash + Eq + 'static,
+    T: StreamData + Send + std::fmt::Debug + Clone + 'static,
+    OpChain: Operator<T> + Send + 'static,
+    OpChain::OUT: StreamData + Send + std::fmt::Debug + Clone + serde::Serialize + 'static,
+    KeyFn: Fn(&OpChain::OUT) -> K + Send + Sync + Clone + 'static,
+{
+    /// Execute the job with the specified parallelism.
+    ///
+    /// Applies the operator chain to the source data, serializes each output
+    /// record with bincode, then passes all records through the WASM UDF.
+    /// Returns the raw `Vec<u8>` output from each WASM invocation.
+    ///
+    /// The `_parallelism` parameter is accepted for API consistency with
+    /// [`ReduceJob::execute_with_parallelism`] but is not yet used; v1 runs
+    /// all records through a single `WasmOperator` instance.
+    pub fn execute_with_parallelism(mut self, _parallelism: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+        use streamcrab_core::state::HashMapStateBackend;
+        use streamcrab_wasm::operator::WasmOperator;
+
+        // Step 1: apply the operator chain to produce typed records.
+        let mut chain_output: Vec<OpChain::OUT> = Vec::new();
+        self.op_chain
+            .process_batch(&self.source_data, &mut chain_output)?;
+
+        // Step 2: serialize each record to bytes for the WASM ABI.
+        let serialized: Vec<Vec<u8>> = chain_output
+            .iter()
+            .map(|r| bincode::serialize(r).map_err(|e| anyhow::anyhow!("bincode: {e}")))
+            .collect::<anyhow::Result<_>>()?;
+
+        // Step 3: create WASM operator with a local HashMapStateBackend.
+        let backend = HashMapStateBackend::new();
+        let mut wasm_op = WasmOperator::new(self.wasm_bytes, self.wasm_config, Some(backend))?;
+
+        // Use a single default key for the entire batch (v1 simplification).
+        wasm_op.set_current_key(b"default".to_vec());
+
+        // Step 4: run the batch through the WASM operator.
+        let mut results = Vec::new();
+        wasm_op.process_batch(&serialized, &mut results)?;
+
+        Ok(results)
     }
 }

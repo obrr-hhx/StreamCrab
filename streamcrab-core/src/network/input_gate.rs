@@ -52,6 +52,7 @@ impl<T> InputGate<T> {
     /// Skips channels that have already ended.
     ///
     /// Returns error when all channels have ended.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<(ChannelIndex, StreamElement<T>)> {
         if self.ended_count == self.channels.len() {
             return Err(anyhow!("All input channels have ended"));
@@ -77,7 +78,7 @@ impl<T> InputGate<T> {
             // Receive from the selected channel
             let element = oper
                 .recv(&self.channels[channel_idx].receiver)
-                .map_err(|_| anyhow!("Channel {} closed unexpectedly", channel_idx))?;
+                .map_err(|_| anyhow!("Channel {channel_idx} closed unexpectedly"))?;
 
             // Check if this is an End marker
             if matches!(element, StreamElement::End) {
@@ -130,7 +131,7 @@ impl<T> InputGate<T> {
             let channel_idx = active_indices[selected_idx];
             let element = oper
                 .recv(&self.channels[channel_idx].receiver)
-                .map_err(|_| anyhow!("Channel {} closed unexpectedly", channel_idx))?;
+                .map_err(|_| anyhow!("Channel {channel_idx} closed unexpectedly"))?;
 
             if matches!(element, StreamElement::End) {
                 self.mark_ended(channel_idx);

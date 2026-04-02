@@ -71,7 +71,7 @@ impl NetworkManager {
             .expect("connections poisoned")
             .get(tm_id)
             .cloned()
-            .ok_or_else(|| anyhow!("connection to {} not found", tm_id))?;
+            .ok_or_else(|| anyhow!("connection to {tm_id} not found"))?;
         conn.send_data(frame).await
     }
 
@@ -83,7 +83,7 @@ impl NetworkManager {
             .expect("connections poisoned")
             .get(tm_id)
             .cloned()
-            .ok_or_else(|| anyhow!("connection to {} not found", tm_id))?;
+            .ok_or_else(|| anyhow!("connection to {tm_id} not found"))?;
         conn.send_control(frame)
     }
 

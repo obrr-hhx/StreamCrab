@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 streamcrab-core = { workspace = true }
+streamcrab-wasm = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 bincode = { workspace = true }

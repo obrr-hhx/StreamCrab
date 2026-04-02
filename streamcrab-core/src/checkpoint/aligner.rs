@@ -50,7 +50,7 @@ impl<T> BarrierAligner<T> {
         element: StreamElement<T>,
     ) -> Result<BarrierAlignResult<T>> {
         if channel_idx >= self.num_inputs {
-            return Err(anyhow!("channel index {} out of bounds", channel_idx));
+            return Err(anyhow!("channel index {channel_idx} out of bounds"));
         }
 
         match element {

@@ -16,13 +16,13 @@ use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use streamcrab_vectorized::VeloxBatch;
+use streamcrab_vectorized::expression::eval::{add, col, gt, lit_f64, mul};
 use streamcrab_vectorized::operators::{
     AggregateDescriptor, AggregateFunction, FilterOperator, HashAggregateOperator,
-    HashJoinOperator, JoinType, ProjectOperator, Projection, VectorizedOperator,
-    WindowAggFunction, WindowAggregateDescriptor, WindowAggregateOperator, WindowType,
+    HashJoinOperator, JoinType, ProjectOperator, Projection, VectorizedOperator, WindowAggFunction,
+    WindowAggregateDescriptor, WindowAggregateOperator, WindowType,
 };
-use streamcrab_vectorized::expression::eval::{add, col, gt, lit_f64, mul};
-use streamcrab_vectorized::VeloxBatch;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -98,8 +98,8 @@ fn test_benchmark_project_throughput() {
     let batch = make_large_batch(N);
 
     let projections = vec![
-        Projection::Column(0),  // id pass-through
-        Projection::Column(1),  // value pass-through
+        Projection::Column(0), // id pass-through
+        Projection::Column(1), // value pass-through
         Projection::Computed {
             expr: add(mul(col(1), lit_f64(2.0)), lit_f64(1.0)),
             name: "computed".into(),
@@ -151,8 +151,16 @@ fn test_benchmark_hash_aggregate_throughput() {
         let mut op = HashAggregateOperator::new(
             vec![0],
             vec![
-                AggregateDescriptor { function: AggregateFunction::Sum,   input_col: 1, output_name: "s".into() },
-                AggregateDescriptor { function: AggregateFunction::Count, input_col: 1, output_name: "c".into() },
+                AggregateDescriptor {
+                    function: AggregateFunction::Sum,
+                    input_col: 1,
+                    output_name: "s".into(),
+                },
+                AggregateDescriptor {
+                    function: AggregateFunction::Count,
+                    input_col: 1,
+                    output_name: "c".into(),
+                },
             ],
         );
         op.add_input(VeloxBatch::new(batch.clone())).unwrap();
@@ -163,11 +171,21 @@ fn test_benchmark_hash_aggregate_throughput() {
     let mut op_for_flush = HashAggregateOperator::new(
         vec![0],
         vec![
-            AggregateDescriptor { function: AggregateFunction::Sum,   input_col: 1, output_name: "s".into() },
-            AggregateDescriptor { function: AggregateFunction::Count, input_col: 1, output_name: "c".into() },
+            AggregateDescriptor {
+                function: AggregateFunction::Sum,
+                input_col: 1,
+                output_name: "s".into(),
+            },
+            AggregateDescriptor {
+                function: AggregateFunction::Count,
+                input_col: 1,
+                output_name: "c".into(),
+            },
         ],
     );
-    op_for_flush.add_input(VeloxBatch::new(batch.clone())).unwrap();
+    op_for_flush
+        .add_input(VeloxBatch::new(batch.clone()))
+        .unwrap();
 
     let flush_start = Instant::now();
     let _ = op_for_flush.on_watermark(0).unwrap();
@@ -223,7 +241,9 @@ fn test_benchmark_hash_join_throughput() {
     // Measure build time.
     let build_start = Instant::now();
     let mut built_op = HashJoinOperator::new(JoinType::Inner, vec![0], vec![0]);
-    built_op.add_input(VeloxBatch::new(build_batch.clone())).unwrap();
+    built_op
+        .add_input(VeloxBatch::new(build_batch.clone()))
+        .unwrap();
     built_op.finish_build();
     let build_d = build_start.elapsed();
 
@@ -302,7 +322,9 @@ fn test_benchmark_window_aggregate_throughput() {
             output_name: "s".into(),
         }],
     );
-    op_for_flush.add_input(VeloxBatch::new(batch.clone())).unwrap();
+    op_for_flush
+        .add_input(VeloxBatch::new(batch.clone()))
+        .unwrap();
 
     let flush_start = Instant::now();
     for w in 1..=NUM_WINDOWS {
@@ -340,12 +362,12 @@ fn test_benchmark_arrow_ffi_roundtrip() {
         let struct_array = StructArray::from(rb.clone());
         let (ffi_array, ffi_schema) = to_ffi(&struct_array.to_data()).unwrap();
         let schema_ptr = Box::into_raw(Box::new(ffi_schema));
-        let array_ptr  = Box::into_raw(Box::new(ffi_array));
+        let array_ptr = Box::into_raw(Box::new(ffi_array));
 
         // Import: FFI pointer pair → VeloxBatch (simulates Java→Rust import).
         let imported = unsafe {
             let ffi_schema2 = Box::from_raw(schema_ptr);
-            let ffi_array2  = Box::from_raw(array_ptr);
+            let ffi_array2 = Box::from_raw(array_ptr);
             let array_data = from_ffi(*ffi_array2, &*ffi_schema2).unwrap();
             let struct_arr = StructArray::from(array_data);
             let _rb2 = RecordBatch::from(struct_arr);

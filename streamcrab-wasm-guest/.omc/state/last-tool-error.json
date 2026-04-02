@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /Users/huanghx/code/streamCrab && cargo test -p streamcrab-core connectors 2>&1\",\"timeout\":180000,\"description\":\"Run connectors tests after pkgconf install\"}",
+  "error": "Exit code 101\n   Compiling proc-macro-crate v3.5.0\n   Compiling rdkafka-sys v4.10.0+2.12.1\n   Compiling num_enum_derive v0.7.6\n   Compiling num_enum v0.7.6\n   Compiling rdkafka v0.36.2\n   Compiling streamcrab-core v0.1.0 (/Users/huanghx/code/streamCrab/streamcrab-core)\nerror[E0433]: failed to resolve: use of unresolved module or unlinked crate `serde_json`\n   --> streamcrab-core/src/connectors/kafka.rs:341:20\n    |\n341 |         let json = serde_json::to_string(&original).expect(\"serialize\");\n  ...",
+  "timestamp": "2026-04-02T15:45:49.029Z",
+  "retry_count": 2
+}

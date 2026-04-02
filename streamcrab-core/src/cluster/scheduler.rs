@@ -64,7 +64,7 @@ impl RoundRobinScheduler {
                 }
             }
 
-            let tm_id = assigned_tm.ok_or_else(|| anyhow!("unable to assign task {}", task_id))?;
+            let tm_id = assigned_tm.ok_or_else(|| anyhow!("unable to assign task {task_id}"))?;
             *used_slots.entry(tm_id.clone()).or_insert(0) += 1;
             assigned.insert(task_id.clone(), tm_id);
         }

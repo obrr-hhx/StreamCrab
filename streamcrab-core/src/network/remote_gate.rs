@@ -57,7 +57,7 @@ impl RemoteInputGate {
         let sender = self
             .channel_senders
             .get(&channel_id)
-            .ok_or_else(|| anyhow!("unknown input channel id {}", channel_id))?;
+            .ok_or_else(|| anyhow!("unknown input channel id {channel_id}"))?;
         sender.send(element)
     }
 
@@ -85,7 +85,7 @@ impl RemoteOutputGate {
             .output_channel_ids
             .get(output_index)
             .copied()
-            .ok_or_else(|| anyhow!("invalid output index {}", output_index))?;
+            .ok_or_else(|| anyhow!("invalid output index {output_index}"))?;
         encode_stream_element(channel_id, element)
     }
 

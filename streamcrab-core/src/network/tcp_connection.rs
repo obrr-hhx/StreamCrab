@@ -35,14 +35,9 @@ impl TcpConnection {
         let (data_tx, mut data_rx) = mpsc::channel::<Frame>(data_capacity);
 
         tokio::spawn(async move {
-            loop {
-                match read_frame(&mut read_half).await {
-                    Ok(frame) => {
-                        if incoming_tx.send(frame).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(frame) = read_frame(&mut read_half).await {
+                if incoming_tx.send(frame).await.is_err() {
+                    break;
                 }
             }
         });

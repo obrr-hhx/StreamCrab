@@ -7,7 +7,7 @@
 //! always materializing the result as a compact RecordBatch.
 
 use crate::batch::VeloxBatch;
-use crate::expression::eval::{evaluate, evaluate_bool, Expr};
+use crate::expression::eval::{Expr, evaluate, evaluate_bool};
 use crate::operators::VectorizedOperator;
 use anyhow::{Context, Result};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -126,7 +126,7 @@ impl VectorizedOperator for ProjectOperator {
                     data_type,
                 } => {
                     let arr = evaluate(expr, &materialized)
-                        .with_context(|| format!("ProjectOperator: evaluate '{}'", name))?;
+                        .with_context(|| format!("ProjectOperator: evaluate '{name}'"))?;
                     fields.push(Field::new(name, data_type.clone(), true));
                     columns.push(arr);
                 }
@@ -281,10 +281,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        assert_eq!(
-            doubled.values(),
-            &[20.0f64, 40.0, 60.0, 80.0, 100.0]
-        );
+        assert_eq!(doubled.values(), &[20.0f64, 40.0, 60.0, 80.0, 100.0]);
     }
 
     // ── Pipeline test ────────────────────────────────────────────────────────
@@ -294,13 +291,8 @@ mod tests {
     #[test]
     fn test_pipeline_project_then_filter() {
         // Step 1: project id (col 0) and value (col 2).
-        let mut project = ProjectOperator::new(vec![
-            Projection::Column(0),
-            Projection::Column(2),
-        ]);
-        project
-            .add_input(VeloxBatch::new(sample_batch()))
-            .unwrap();
+        let mut project = ProjectOperator::new(vec![Projection::Column(0), Projection::Column(2)]);
+        project.add_input(VeloxBatch::new(sample_batch())).unwrap();
         let projected = project.get_output().unwrap().unwrap();
 
         // Step 2: filter id > 2 (now at index 0 in the projected batch).
@@ -312,11 +304,7 @@ mod tests {
         assert_eq!(rb.num_rows(), 3);
         assert_eq!(rb.num_columns(), 2);
 
-        let ids = rb
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let ids = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ids.values(), &[3i64, 4, 5]);
     }
 }

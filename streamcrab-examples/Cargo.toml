@@ -9,3 +9,5 @@ streamcrab-api = { workspace = true }
 streamcrab-core = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }

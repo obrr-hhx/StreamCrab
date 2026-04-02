@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arrow::array::{
-    new_null_array, Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, new_null_array,
 };
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp::{
@@ -20,8 +20,8 @@ use arrow::compute::kernels::numeric::{
 };
 use arrow::compute::{is_not_null, is_null};
 use arrow::datatypes::DataType;
-use arrow_array::cast::AsArray;
 use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -112,11 +112,7 @@ pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
 
         Expr::Literal(scalar) => Ok(scalar_to_array(scalar, batch.num_rows())),
 
-        Expr::BinaryOp {
-            op,
-            left,
-            right,
-        } => {
+        Expr::BinaryOp { op, left, right } => {
             let l = evaluate(left, batch)?;
             let r = evaluate(right, batch)?;
             apply_binary_op(*op, &l, &r)
@@ -691,7 +687,11 @@ mod tests {
         //   Kleene AND:    [F,  T,  T,  F,     null]
         //     row3: null AND false = false  (false dominates)
         //     row4: true AND null  = null
-        let result = evaluate_bool(&and(gt(col(0), lit_i64(1)), lt(col(1), lit_f64(35.0))), &batch).unwrap();
+        let result = evaluate_bool(
+            &and(gt(col(0), lit_i64(1)), lt(col(1), lit_f64(35.0))),
+            &batch,
+        )
+        .unwrap();
         assert_eq!(result.value(0), false);
         assert_eq!(result.value(1), true);
         assert_eq!(result.value(2), true);
@@ -708,9 +708,9 @@ mod tests {
         let result = evaluate_bool(&gt(mul(col(0), lit_i64(2)), lit_i64(5)), &batch).unwrap();
         assert_eq!(result.value(0), false); // 2 > 5
         assert_eq!(result.value(1), false); // 4 > 5
-        assert_eq!(result.value(2), true);  // 6 > 5
-        assert!(result.is_null(3));         // null
-        assert_eq!(result.value(4), true);  // 10 > 5
+        assert_eq!(result.value(2), true); // 6 > 5
+        assert!(result.is_null(3)); // null
+        assert_eq!(result.value(4), true); // 10 > 5
     }
 
     #[test]

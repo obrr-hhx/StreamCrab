@@ -22,7 +22,7 @@ impl TryFrom<u8> for FrameType {
             3 => Ok(FrameType::Watermark),
             4 => Ok(FrameType::End),
             5 => Ok(FrameType::Control),
-            other => Err(anyhow!("unknown frame type: {}", other)),
+            other => Err(anyhow!("unknown frame type: {other}")),
         }
     }
 }

@@ -17,7 +17,9 @@ pub mod hash_join;
 pub use hash_join::{HashJoinOperator, JoinType};
 
 pub mod window_aggregate;
-pub use window_aggregate::{WindowAggregateOperator, WindowType, WindowAggFunction, WindowAggregateDescriptor};
+pub use window_aggregate::{
+    WindowAggFunction, WindowAggregateDescriptor, WindowAggregateOperator, WindowType,
+};
 
 use crate::batch::VeloxBatch;
 use anyhow::Result;

@@ -1,3 +1,5 @@
+pub mod nexmark;
+
 use streamcrab_api::environment::StreamExecutionEnvironment;
 
 fn main() -> anyhow::Result<()> {

@@ -1,0 +1,12 @@
+[package]
+name = "wasm-counter"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+streamcrab-wasm-guest = { path = "../../streamcrab-wasm-guest" }

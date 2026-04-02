@@ -177,11 +177,10 @@ pub fn serialize_row_key(columns: &[ArrayRef], row: usize) -> Vec<u8> {
 
 /// Compute a u64 hash of the key composed of `columns[*][row]`.
 pub fn hash_row_key(hasher: &RandomState, columns: &[ArrayRef], row: usize) -> u64 {
-    use std::hash::{BuildHasher, Hash, Hasher};
+    #[allow(unused_imports)]
+    use std::hash::BuildHasher;
     let key_bytes = serialize_row_key(columns, row);
-    let mut h = hasher.build_hasher();
-    key_bytes.hash(&mut h);
-    h.finish()
+    hasher.hash_one(&key_bytes)
 }
 
 // Type tags used in serialize_row_key.

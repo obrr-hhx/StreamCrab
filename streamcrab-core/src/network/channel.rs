@@ -40,7 +40,7 @@ impl<T> LocalChannelSender<T> {
     pub fn try_send(&self, element: StreamElement<T>) -> Result<()> {
         self.sender
             .try_send(element)
-            .map_err(|e| anyhow!("Failed to send: {:?}", e))
+            .map_err(|e| anyhow!("Failed to send: {e:?}"))
     }
 }
 
@@ -74,7 +74,7 @@ impl<T> LocalChannelReceiver<T> {
 
     /// Check if the channel is closed (all senders dropped).
     pub fn is_closed(&self) -> bool {
-        self.receiver.is_empty() && self.receiver.len() == 0
+        self.receiver.is_empty() && self.receiver.is_empty()
     }
 }
 

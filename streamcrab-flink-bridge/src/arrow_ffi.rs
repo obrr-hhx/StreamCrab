@@ -4,10 +4,10 @@
 //! point to heap-allocated `FFI_ArrowSchema` / `FFI_ArrowArray` structs.
 //! These functions import/export those pointers into Rust `VeloxBatch` values.
 
+use anyhow::{Context, Result};
 use arrow::array::{Array, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 use arrow::record_batch::RecordBatch;
-use anyhow::{Context, Result};
 use streamcrab_vectorized::VeloxBatch;
 
 // ── Import ────────────────────────────────────────────────────────────────────
@@ -122,7 +122,11 @@ mod tests {
         let ids = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ids.values(), &[1i64, 2, 3]);
 
-        let vals = rb.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let vals = rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert_eq!(vals.values(), &[10.0f64, 20.0, 30.0]);
     }
 

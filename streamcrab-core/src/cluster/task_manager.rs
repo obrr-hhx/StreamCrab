@@ -104,7 +104,7 @@ impl DeployedTaskBridge {
         let mut input_receivers = HashMap::new();
         for channel_id in &descriptor.input_channels {
             if input_senders.contains_key(channel_id) {
-                return Err(anyhow!("duplicate input channel id {}", channel_id));
+                return Err(anyhow!("duplicate input channel id {channel_id}"));
             }
             let (sender, receiver) = local_channel_default();
             input_senders.insert(*channel_id, sender);
@@ -114,7 +114,7 @@ impl DeployedTaskBridge {
         let mut seen_output = HashSet::new();
         for channel_id in &descriptor.output_channels {
             if !seen_output.insert(*channel_id) {
-                return Err(anyhow!("duplicate output channel id {}", channel_id));
+                return Err(anyhow!("duplicate output channel id {channel_id}"));
             }
         }
 
@@ -134,7 +134,7 @@ impl DeployedTaskBridge {
         let receiver = self
             .input_receivers
             .get(&channel_id)
-            .ok_or_else(|| anyhow!("unknown input channel id {}", channel_id))?;
+            .ok_or_else(|| anyhow!("unknown input channel id {channel_id}"))?;
         receiver.try_recv()
     }
 
@@ -285,7 +285,7 @@ impl TaskManager {
         let guard = self.deployed_tasks.lock().expect("deployed_tasks poisoned");
         let bridge = guard
             .get(task_id)
-            .ok_or_else(|| anyhow!("task {} not deployed", task_id))?;
+            .ok_or_else(|| anyhow!("task {task_id} not deployed"))?;
         bridge.ingest_frame(frame)
     }
 
@@ -297,7 +297,7 @@ impl TaskManager {
         let guard = self.deployed_tasks.lock().expect("deployed_tasks poisoned");
         let bridge = guard
             .get(task_id)
-            .ok_or_else(|| anyhow!("task {} not deployed", task_id))?;
+            .ok_or_else(|| anyhow!("task {task_id} not deployed"))?;
         bridge.try_recv_input(channel_id)
     }
 
@@ -310,7 +310,7 @@ impl TaskManager {
         let guard = self.deployed_tasks.lock().expect("deployed_tasks poisoned");
         let bridge = guard
             .get(task_id)
-            .ok_or_else(|| anyhow!("task {} not deployed", task_id))?;
+            .ok_or_else(|| anyhow!("task {task_id} not deployed"))?;
         bridge.encode_output(output_index, element)
     }
 
@@ -324,7 +324,7 @@ impl TaskManager {
             guard
                 .get(&channel_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no deployed task for input channel {}", channel_id))?
+                .ok_or_else(|| anyhow!("no deployed task for input channel {channel_id}"))?
         };
         self.ingest_remote_input_frame(&task_id, frame)
     }
@@ -755,8 +755,7 @@ impl TaskManagerService for TaskManagerRpc {
                 if let Some(existing) = channel_map.get(channel_id) {
                     if existing != &task_id {
                         return Err(Status::already_exists(format!(
-                            "input channel {} already assigned to task {}",
-                            channel_id, existing
+                            "input channel {channel_id} already assigned to task {existing}"
                         )));
                     }
                 }

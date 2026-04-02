@@ -16,6 +16,7 @@ tonic = "0.12"
 prost = "0.13"
 tokio = { workspace = true }
 arc-swap = "1"
+rdkafka = { version = "0.36", features = ["dynamic-linking"] }
 
 [build-dependencies]
 tonic-build = "0.12"

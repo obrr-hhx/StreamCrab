@@ -384,7 +384,8 @@ impl StateServiceCore {
     }
 
     fn mark_updated(&mut self, key: &[u8]) {
-        self.last_updated_ms.insert(key.to_vec(), current_unix_millis());
+        self.last_updated_ms
+            .insert(key.to_vec(), current_unix_millis());
     }
 
     fn cleanup_expired(&mut self) {
@@ -471,7 +472,10 @@ impl InMemoryStateClient {
         Self::with_writer_id(core, "in-memory-client")
     }
 
-    pub fn with_writer_id(core: Arc<Mutex<StateServiceCore>>, writer_id: impl Into<String>) -> Self {
+    pub fn with_writer_id(
+        core: Arc<Mutex<StateServiceCore>>,
+        writer_id: impl Into<String>,
+    ) -> Self {
         Self {
             core,
             writer_id: writer_id.into(),
@@ -507,7 +511,9 @@ impl StateServiceClient for InMemoryStateClient {
     }
 
     fn batch_put(&self, entries: Vec<(Vec<u8>, Vec<u8>)>, epoch: u64) -> Result<()> {
-        let base_seq_no = self.next_seq.fetch_add(entries.len() as u64, Ordering::SeqCst);
+        let base_seq_no = self
+            .next_seq
+            .fetch_add(entries.len() as u64, Ordering::SeqCst);
         self.core
             .lock()
             .map_err(|_| anyhow!("state core lock poisoned"))?
@@ -570,7 +576,7 @@ impl GrpcStateClient {
         let endpoint = endpoint.into();
         Self {
             endpoint: normalize_endpoint(&endpoint),
-            writer_id: format!("grpc-client@{}", endpoint),
+            writer_id: format!("grpc-client@{endpoint}"),
             next_seq: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -585,10 +591,10 @@ impl GrpcStateClient {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| anyhow!("create runtime failed: {}", e))?;
+                    .map_err(|e| anyhow!("create runtime failed: {e}"))?;
                 runtime
                     .block_on(fut)
-                    .map_err(|status| anyhow!("state service rpc failed: {}", status))
+                    .map_err(|status| anyhow!("state service rpc failed: {status}"))
             });
             join.join()
                 .map_err(|_| anyhow!("state service rpc worker thread panicked"))?
@@ -596,7 +602,7 @@ impl GrpcStateClient {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime
                 .block_on(fut)
-                .map_err(|status| anyhow!("state service rpc failed: {}", status))
+                .map_err(|status| anyhow!("state service rpc failed: {status}"))
         }
     }
 }
@@ -670,7 +676,9 @@ impl StateServiceClient for GrpcStateClient {
     fn batch_put(&self, entries: Vec<(Vec<u8>, Vec<u8>)>, epoch: u64) -> Result<()> {
         let endpoint = self.endpoint.clone();
         let task_id = self.writer_id.clone();
-        let base_seq_no = self.next_seq.fetch_add(entries.len() as u64, Ordering::SeqCst);
+        let base_seq_no = self
+            .next_seq
+            .fetch_add(entries.len() as u64, Ordering::SeqCst);
         let entries = entries
             .into_iter()
             .map(|(key, value)| rpc::StateEntry { key, value })
@@ -821,7 +829,8 @@ impl StateService for StateServiceRpc {
         request: Request<rpc::PutRequest>,
     ) -> Result<Response<rpc::PutResponse>, Status> {
         let req = request.into_inner();
-        let accepted = self.core
+        let accepted = self
+            .core
             .lock()
             .map_err(|_| Status::internal("state core lock poisoned"))?
             .put_with_meta(
@@ -919,7 +928,9 @@ impl StateService for StateServiceRpc {
             .map_err(|_| Status::internal("state core lock poisoned"))?
             .trigger_snapshot(req.epoch)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        Ok(Response::new(rpc::TriggerSnapshotResponse { accepted: true }))
+        Ok(Response::new(rpc::TriggerSnapshotResponse {
+            accepted: true,
+        }))
     }
 
     async fn seal(
@@ -966,7 +977,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
     } else {
-        format!("http://{}", endpoint)
+        format!("http://{endpoint}")
     }
 }
 

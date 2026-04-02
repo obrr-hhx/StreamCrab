@@ -311,7 +311,7 @@ where
 
                 output_batch.clear();
                 self.operator_chain
-                    .process_batch(&input_batch, output_batch)?;
+                    .process_batch(input_batch, output_batch)?;
 
                 // Emit outputs to downstream
                 for output in &*output_batch {

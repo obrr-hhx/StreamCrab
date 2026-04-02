@@ -282,7 +282,7 @@ impl HashAggregateOperator {
                 }
             };
 
-            let field_name = format!("group_{}", src_col_idx);
+            let field_name = format!("group_{src_col_idx}");
             fields.push(Field::new(field_name, data_type, true));
             columns.push(col_arr);
         }
@@ -422,8 +422,8 @@ impl VectorizedOperator for HashAggregateOperator {
         if data.is_empty() {
             return Ok(());
         }
-        let snap: SnapshotData =
-            bincode::deserialize(data).context("HashAggregateOperator: restore_state deserialize")?;
+        let snap: SnapshotData = bincode::deserialize(data)
+            .context("HashAggregateOperator: restore_state deserialize")?;
         self.groups = snap
             .groups
             .into_iter()
@@ -459,7 +459,9 @@ mod tests {
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["eng", "sales", "eng", "sales", "eng"])),
+                Arc::new(StringArray::from(vec![
+                    "eng", "sales", "eng", "sales", "eng",
+                ])),
                 Arc::new(Float64Array::from(vec![100.0, 200.0, 150.0, 50.0, 200.0])),
             ],
         )
@@ -600,7 +602,11 @@ mod tests {
 
         // sales avg: 250 / 2 = 125.0
         let sales_avg = f64_val(&rb, 1, sales_row);
-        assert!((sales_avg - 125.0).abs() < 1e-9, "sales avg = {}", sales_avg);
+        assert!(
+            (sales_avg - 125.0).abs() < 1e-9,
+            "sales avg = {}",
+            sales_avg
+        );
     }
 
     // ── Test 4: on_watermark triggers output and resets state ─────────────────
@@ -622,7 +628,10 @@ mod tests {
 
         // After watermark, state should be reset — second watermark yields nothing.
         let second = op.on_watermark(200).unwrap();
-        assert!(second.is_empty(), "state should be cleared after first flush");
+        assert!(
+            second.is_empty(),
+            "state should be cleared after first flush"
+        );
 
         // Adding new data after reset should produce fresh results.
         let schema = Arc::new(Schema::new(vec![

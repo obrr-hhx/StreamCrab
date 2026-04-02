@@ -23,7 +23,7 @@ where
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env))) {
         Ok(Ok(val)) => val,
         Ok(Err(e)) => {
-            throw_java_exception(env, &format!("{:#}", e));
+            throw_java_exception(env, &format!("{e:#}"));
             default_val
         }
         Err(_panic) => {

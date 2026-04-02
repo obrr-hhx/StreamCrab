@@ -89,35 +89,17 @@ fn test_state_service_ttl_evicts_expired_keys() {
 fn test_state_service_put_sequence_idempotency() {
     let mut core = StateServiceCore::new(StateServiceCoreConfig::default());
     let accepted = core
-        .put_with_meta(
-            b"k".to_vec(),
-            b"v1".to_vec(),
-            1,
-            Some("task-a"),
-            Some(1),
-        )
+        .put_with_meta(b"k".to_vec(), b"v1".to_vec(), 1, Some("task-a"), Some(1))
         .unwrap();
     assert!(accepted);
     let dup = core
-        .put_with_meta(
-            b"k".to_vec(),
-            b"v2".to_vec(),
-            1,
-            Some("task-a"),
-            Some(1),
-        )
+        .put_with_meta(b"k".to_vec(), b"v2".to_vec(), 1, Some("task-a"), Some(1))
         .unwrap();
     assert!(!dup);
     assert_eq!(core.get(b"k", 1), Some(b"v1".to_vec()));
 
     let accepted_next = core
-        .put_with_meta(
-            b"k".to_vec(),
-            b"v3".to_vec(),
-            1,
-            Some("task-a"),
-            Some(2),
-        )
+        .put_with_meta(b"k".to_vec(), b"v3".to_vec(), 1, Some("task-a"), Some(2))
         .unwrap();
     assert!(accepted_next);
     assert_eq!(core.get(b"k", 1), Some(b"v3".to_vec()));

@@ -250,7 +250,7 @@ where
         for (key, value) in input {
             // Serialize key for state backend
             let key_bytes = bincode::serialize(key)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize key: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to serialize key: {e}"))?;
 
             // Set current key in state backend
             self.state_backend.set_current_key(key_bytes);
@@ -369,7 +369,7 @@ where
         for (key, value) in input {
             // Serialize key for state backend
             let key_bytes = bincode::serialize(key)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize key: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to serialize key: {e}"))?;
 
             // Set current key in state backend
             self.state_backend.set_current_key(key_bytes);

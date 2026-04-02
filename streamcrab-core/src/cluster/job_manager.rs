@@ -38,7 +38,8 @@ pub struct JobManager {
     job_task_locations: RwLock<HashMap<JobId, Vec<TaskLocation>>>,
     job_parallelism: RwLock<HashMap<JobId, usize>>,
     job_plans: RwLock<HashMap<JobId, Vec<u8>>>,
-    job_operator_runtime: RwLock<HashMap<JobId, HashMap<u32, crate::runtime::descriptors::OperatorRuntimeConfig>>>,
+    job_operator_runtime:
+        RwLock<HashMap<JobId, HashMap<u32, crate::runtime::descriptors::OperatorRuntimeConfig>>>,
     job_source_offsets: RwLock<HashMap<JobId, u64>>,
     job_committed_source_offsets: RwLock<HashMap<JobId, u64>>,
     task_to_job: RwLock<HashMap<String, JobId>>,
@@ -188,7 +189,7 @@ impl JobManager {
             .expect("jobs poisoned")
             .contains_key(job_id)
         {
-            return Err(anyhow!("job {} not found", job_id));
+            return Err(anyhow!("job {job_id} not found"));
         }
         self.job_source_offsets
             .write()
@@ -203,8 +204,7 @@ impl JobManager {
                 && matches!(guarantee, SinkGuarantee::AtLeastOnce)
             {
                 return Err(anyhow!(
-                    "sink operator {} uses AtLeastOnce; exactly-once checkpointing requires idempotent or 2PC sink",
-                    idx
+                    "sink operator {idx} uses AtLeastOnce; exactly-once checkpointing requires idempotent or 2PC sink"
                 ));
             }
         }
@@ -318,7 +318,10 @@ impl JobManager {
                 .read()
                 .expect("job_operator_runtime poisoned");
             let jobs = self.jobs.read().expect("jobs poisoned");
-            let parallelism = self.job_parallelism.read().expect("job_parallelism poisoned");
+            let parallelism = self
+                .job_parallelism
+                .read()
+                .expect("job_parallelism poisoned");
             let mut autoscaler = self.autoscaler.lock().expect("autoscaler poisoned");
             let mut pending = Vec::new();
 
@@ -392,9 +395,7 @@ impl JobManager {
             && !matches!(runtime.state_mode, StateMode::Tiered { .. })
         {
             return Err(anyhow!(
-                "operator {} in job {} uses Local state mode; online rescale requires Tiered",
-                operator_id,
-                job_id
+                "operator {operator_id} in job {job_id} uses Local state mode; online rescale requires Tiered"
             ));
         }
         drop(runtime_map);
@@ -415,9 +416,7 @@ impl JobManager {
             && assigner.to_ascii_lowercase().contains("session")
         {
             return Err(anyhow!(
-                "session window operator {} in job {} does not support online rescale",
-                operator_id,
-                job_id
+                "session window operator {operator_id} in job {job_id} does not support online rescale"
             ));
         }
         Ok(())
@@ -494,7 +493,7 @@ impl JobManager {
         let managers = self.task_managers.read().expect("task_managers poisoned");
         let info = managers
             .get(tm_id)
-            .ok_or_else(|| anyhow!("task manager {} not found", tm_id))?;
+            .ok_or_else(|| anyhow!("task manager {tm_id} not found"))?;
         if info.address.starts_with("http://") || info.address.starts_with("https://") {
             Ok(info.address.clone())
         } else {
@@ -518,7 +517,7 @@ impl JobManager {
                 let mut client =
                     TaskManagerServiceClient::connect(self.task_manager_endpoint(tm_id)?).await?;
                 let task = parse_task_id(task_id)
-                    .ok_or_else(|| anyhow!("invalid task id generated: {}", task_id))?;
+                    .ok_or_else(|| anyhow!("invalid task id generated: {task_id}"))?;
                 let descriptor = TaskDeploymentDescriptor {
                     task_id: task_id.clone(),
                     vertex_id: task.vertex_id.0,
@@ -558,10 +557,7 @@ impl JobManager {
                     self.cancel_deployed_tasks_best_effort(&deployed_so_far)
                         .await;
                     return Err(anyhow!(
-                        "deploy task {} to {} RPC failed: {}",
-                        task_id,
-                        tm_id,
-                        err
+                        "deploy task {task_id} to {tm_id} RPC failed: {err}"
                     ));
                 }
             }
@@ -626,7 +622,7 @@ impl JobManager {
             .read()
             .expect("job_parallelism poisoned")
             .get(job_id)
-            .ok_or_else(|| anyhow!("parallelism not found for job {}", job_id))?;
+            .ok_or_else(|| anyhow!("parallelism not found for job {job_id}"))?;
         let task_ids: Vec<String> = (0..parallelism)
             .map(|i| deployment_task_id(job_id, TaskId::new(VertexId::new(0), i)))
             .collect();
@@ -715,7 +711,7 @@ impl JobManager {
             .expect("job_task_locations poisoned")
             .get(job_id)
             .cloned()
-            .ok_or_else(|| anyhow!("job {} has no deployed tasks", job_id));
+            .ok_or_else(|| anyhow!("job {job_id} has no deployed tasks"));
         let locations = match locations_result {
             Ok(v) => v,
             Err(err) => {
@@ -811,7 +807,7 @@ impl JobManager {
                 .expect("job_task_locations poisoned");
             let locations = locations_guard
                 .get_mut(job_id)
-                .ok_or_else(|| anyhow!("job {} has no deployed task locations", job_id))?;
+                .ok_or_else(|| anyhow!("job {job_id} has no deployed task locations"))?;
 
             if new_parallelism > old_parallelism {
                 for loc in prepared_locations {
@@ -885,15 +881,12 @@ impl JobManager {
                 .contains(&checkpoint_id)
             {
                 return Err(anyhow!(
-                    "checkpoint {} aborted while waiting for rescale",
-                    checkpoint_id
+                    "checkpoint {checkpoint_id} aborted while waiting for rescale"
                 ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(
-                    "checkpoint {} did not complete before timeout {:?}",
-                    checkpoint_id,
-                    timeout
+                    "checkpoint {checkpoint_id} did not complete before timeout {timeout:?}"
                 ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -919,12 +912,10 @@ impl JobManager {
             .read()
             .expect("job_parallelism poisoned")
             .get(job_id)
-            .ok_or_else(|| anyhow!("parallelism not found for job {}", job_id))?;
+            .ok_or_else(|| anyhow!("parallelism not found for job {job_id}"))?;
         if old_parallelism == new_parallelism {
             return Err(anyhow!(
-                "job {} already runs at parallelism {}",
-                job_id,
-                new_parallelism
+                "job {job_id} already runs at parallelism {new_parallelism}"
             ));
         }
 
@@ -1068,7 +1059,7 @@ impl JobManager {
             .expect("checkpoint_to_job poisoned")
             .get(&checkpoint_id)
             .cloned()
-            .ok_or_else(|| anyhow!("checkpoint {} has no job mapping", checkpoint_id))?;
+            .ok_or_else(|| anyhow!("checkpoint {checkpoint_id} has no job mapping"))?;
         let locations = self
             .job_task_locations
             .read()
@@ -1424,7 +1415,7 @@ impl JobManagerService for JobManagerRpc {
 }
 
 fn deployment_task_id(job_id: &str, task_id: TaskId) -> String {
-    format!("{job_id}::{}", task_id)
+    format!("{job_id}::{task_id}")
 }
 
 fn extract_job_id_from_deployment_task_id(task_id: &str) -> Option<&str> {

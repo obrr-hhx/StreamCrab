@@ -10,8 +10,8 @@ use crate::cluster::rpc::job_manager_service_client::JobManagerServiceClient;
 use crate::cluster::rpc::job_manager_service_server::JobManagerService;
 use crate::cluster::rpc::task_manager_service_server::TaskManagerService;
 use crate::cluster::{
-    ClusterConfig, HeartbeatConfig, JobManager, OperatorFactory, Resources, RoundRobinScheduler,
-    TaskManager, TaskManagerRpc, JobManagerRpc,
+    ClusterConfig, HeartbeatConfig, JobManager, JobManagerRpc, OperatorFactory, Resources,
+    RoundRobinScheduler, TaskManager, TaskManagerRpc,
 };
 use crate::elastic::{ElasticConfig, ScalePolicy};
 use crate::network::{FrameType, decode_stream_element, encode_stream_element, write_frame};
@@ -473,9 +473,7 @@ async fn test_job_manager_trigger_rescale_rejects_local_state_mode_operator() {
     wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
 
     let err = jm.trigger_rescale(&job_id, 1, 2).await.unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("online rescale requires Tiered"));
+    assert!(err.to_string().contains("online rescale requires Tiered"));
 
     tm_handle.abort();
     jm_handle.abort();
@@ -538,9 +536,7 @@ async fn test_job_manager_trigger_rescale_rejects_session_window_operator() {
     wait_until(Duration::from_secs(2), || tm.deployed_task_count() == 1).await;
 
     let err = jm.trigger_rescale(&job_id, 1, 2).await.unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("does not support online rescale"));
+    assert!(err.to_string().contains("does not support online rescale"));
 
     tm_handle.abort();
     jm_handle.abort();
@@ -862,9 +858,7 @@ async fn test_submit_job_rejects_at_least_once_sink() {
         }))
         .await
         .unwrap_err();
-    assert!(err
-        .message()
-        .contains("requires idempotent or 2PC sink"));
+    assert!(err.message().contains("requires idempotent or 2PC sink"));
 }
 
 #[test]
@@ -1499,16 +1493,22 @@ async fn test_cluster_global_rollback_on_tm_failure() {
 
     jm.report_source_offset(&job_id, 100).unwrap();
     let cp = client
-        .trigger_checkpoint(Request::new(crate::cluster::rpc::TriggerCheckpointRequest {
-            job_id: job_id.clone(),
-        }))
+        .trigger_checkpoint(Request::new(
+            crate::cluster::rpc::TriggerCheckpointRequest {
+                job_id: job_id.clone(),
+            },
+        ))
         .await
         .unwrap()
         .into_inner();
     assert!(cp.accepted);
     wait_until(Duration::from_secs(2), || {
-        tm_alive.completed_checkpoint_ids().contains(&cp.checkpoint_id)
-            && tm_fail.completed_checkpoint_ids().contains(&cp.checkpoint_id)
+        tm_alive
+            .completed_checkpoint_ids()
+            .contains(&cp.checkpoint_id)
+            && tm_fail
+                .completed_checkpoint_ids()
+                .contains(&cp.checkpoint_id)
     })
     .await;
     assert_eq!(jm.committed_source_offset_for_test(&job_id), Some(100));

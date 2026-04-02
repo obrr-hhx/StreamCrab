@@ -92,9 +92,7 @@ impl WatermarkTracker {
     ///
     /// Returns a watermark when the global min advances.
     pub fn detect_idle_channels(&mut self) -> Option<Watermark> {
-        let Some(timeout) = self.idle_timeout else {
-            return None;
-        };
+        let timeout = self.idle_timeout?;
 
         let now = Instant::now();
         let mut changed = false;

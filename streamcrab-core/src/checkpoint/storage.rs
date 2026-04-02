@@ -56,7 +56,7 @@ impl CheckpointStorage for InMemoryCheckpointStorage {
             .map_err(|_| anyhow!("checkpoint metadata lock poisoned"))?
             .get(&checkpoint_id)
             .cloned()
-            .ok_or_else(|| anyhow!("checkpoint {} not found", checkpoint_id))
+            .ok_or_else(|| anyhow!("checkpoint {checkpoint_id} not found"))
     }
 
     fn load_task_state(&self, checkpoint_id: CheckpointId, task_id: TaskId) -> Result<Vec<u8>> {
@@ -65,7 +65,7 @@ impl CheckpointStorage for InMemoryCheckpointStorage {
             .map_err(|_| anyhow!("checkpoint task-state lock poisoned"))?
             .get(&(checkpoint_id, task_id))
             .cloned()
-            .ok_or_else(|| anyhow!("task state not found for checkpoint {}", checkpoint_id))
+            .ok_or_else(|| anyhow!("task state not found for checkpoint {checkpoint_id}"))
     }
 
     fn list_checkpoints(&self) -> Result<Vec<CheckpointId>> {
@@ -132,7 +132,7 @@ impl FsCheckpointStorage {
 
     fn task_state_path(&self, checkpoint_id: CheckpointId, task_id: TaskId) -> PathBuf {
         self.checkpoint_dir(checkpoint_id)
-            .join(format!("task-{}.bin", task_id))
+            .join(format!("task-{task_id}.bin"))
     }
 }
 
