@@ -6,3 +6,11 @@
 
 !.cargo/config.toml
 !.cargo/config
+
+# Example crate build artifacts
+examples/*/target/
+examples/*/Cargo.lock
+
+# Guest crate build artifacts
+streamcrab-wasm-guest/target/
+streamcrab-wasm-guest/Cargo.lock
