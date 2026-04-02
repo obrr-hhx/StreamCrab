@@ -14,3 +14,12 @@ examples/*/Cargo.lock
 # Guest crate build artifacts
 streamcrab-wasm-guest/target/
 streamcrab-wasm-guest/Cargo.lock
+
+# Internal docs (not for repo)
+HANDOFF.md
+CLAUDE.md
+AGENTS.md
+.omc/
+tasks/
+streamcrab-final-v3_6.md
+streamcrab-final-v3_7.md
