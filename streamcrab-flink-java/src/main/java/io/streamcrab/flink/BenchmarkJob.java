@@ -26,8 +26,10 @@ public class BenchmarkJob {
 
         System.out.printf("=== Benchmark: %s mode, %d records ===%n", mode, numRecords);
 
+        int parallelism = args.length > 2 ? Integer.parseInt(args[2]) : 1;
+
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(1);
+        env.setParallelism(parallelism);
 
         // Generate source: (department_id: i64, salary: i64)
         // 10 departments, random salaries
