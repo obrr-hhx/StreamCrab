@@ -1525,6 +1525,8 @@ where
                 let reducer = FnReduceFunction { reduce_fn };
                 let backend = HashMapStateBackend::new();
                 let mut operator = ReduceOperator::new(reducer, backend);
+                let mut input_buf = Vec::with_capacity(1);
+                let mut output_buf = Vec::with_capacity(1);
 
                 loop {
                     let element = receiver.recv()?;
@@ -1532,11 +1534,12 @@ where
                         StreamElement::Record(record) => {
                             let item = record.value;
                             let key = key_fn(&item);
-                            let input = vec![(key, item)];
-                            let mut output = Vec::new();
-                            operator.process_batch(&input, &mut output)?;
+                            input_buf.clear();
+                            input_buf.push((key, item));
+                            output_buf.clear();
+                            operator.process_batch(&input_buf, &mut output_buf)?;
 
-                            for result in output {
+                            for result in output_buf.drain(..) {
                                 sender.send(StreamElement::record(result))?;
                             }
                         }
@@ -1583,6 +1586,8 @@ where
                 let reducer = FnReduceFunction { reduce_fn };
                 let backend = HashMapStateBackend::new();
                 let mut operator = ReduceOperator::new(reducer, backend);
+                let mut input_buf = Vec::with_capacity(1);
+                let mut output_buf = Vec::with_capacity(1);
 
                 loop {
                     let element = receiver.recv()?;
@@ -1590,11 +1595,12 @@ where
                         StreamElement::Record(record) => {
                             let item = record.value;
                             let key = key_fn(&item);
-                            let input = vec![(key, item)];
-                            let mut output = Vec::new();
-                            operator.process_batch(&input, &mut output)?;
+                            input_buf.clear();
+                            input_buf.push((key, item));
+                            output_buf.clear();
+                            operator.process_batch(&input_buf, &mut output_buf)?;
 
-                            for result in output {
+                            for result in output_buf.drain(..) {
                                 sender.send(StreamElement::record(result))?;
                             }
                         }
@@ -1656,6 +1662,8 @@ where
                 let client = Arc::new(InMemoryStateClient::new(state_core));
                 let backend = TieredStateBackend::new(client, TieredStateBackendConfig::default());
                 let mut operator = ReduceOperator::new(reducer, backend);
+                let mut input_buf = Vec::with_capacity(1);
+                let mut output_buf = Vec::with_capacity(1);
 
                 loop {
                     let element = receiver.recv()?;
@@ -1663,11 +1671,12 @@ where
                         StreamElement::Record(record) => {
                             let item = record.value;
                             let key = key_fn(&item);
-                            let input = vec![(key, item)];
-                            let mut output = Vec::new();
-                            operator.process_batch(&input, &mut output)?;
+                            input_buf.clear();
+                            input_buf.push((key, item));
+                            output_buf.clear();
+                            operator.process_batch(&input_buf, &mut output_buf)?;
 
-                            for result in output {
+                            for result in output_buf.drain(..) {
                                 sender.send(StreamElement::record(result))?;
                             }
                         }
@@ -1716,6 +1725,8 @@ where
                 let client = Arc::new(InMemoryStateClient::new(state_core));
                 let backend = TieredStateBackend::new(client, TieredStateBackendConfig::default());
                 let mut operator = ReduceOperator::new(reducer, backend);
+                let mut input_buf = Vec::with_capacity(1);
+                let mut output_buf = Vec::with_capacity(1);
 
                 loop {
                     let element = receiver.recv()?;
@@ -1723,11 +1734,12 @@ where
                         StreamElement::Record(record) => {
                             let item = record.value;
                             let key = key_fn(&item);
-                            let input = vec![(key, item)];
-                            let mut output = Vec::new();
-                            operator.process_batch(&input, &mut output)?;
+                            input_buf.clear();
+                            input_buf.push((key, item));
+                            output_buf.clear();
+                            operator.process_batch(&input_buf, &mut output_buf)?;
 
-                            for result in output {
+                            for result in output_buf.drain(..) {
                                 sender.send(StreamElement::record(result))?;
                             }
                         }
@@ -1774,27 +1786,33 @@ where
         use std::thread;
         use streamcrab_core::types::StreamElement;
 
-        thread::spawn(move || -> anyhow::Result<()> {
-            let mut ended_count = 0;
-            let total_tasks = collector_receivers.len();
-
-            while ended_count < total_tasks {
-                for receiver in &collector_receivers {
-                    match receiver.try_recv() {
-                        Ok(Some(StreamElement::Record(record))) => {
+        // Spawn one collector thread per receiver to avoid deadlock when
+        // p>1: a single collector blocking on receiver[0] can stall the
+        // pipeline if receiver[1]'s channel fills up.
+        let mut collector_handles = Vec::new();
+        for receiver in collector_receivers {
+            let results = Arc::clone(&results);
+            collector_handles.push(thread::spawn(move || -> anyhow::Result<()> {
+                loop {
+                    match receiver.recv()? {
+                        StreamElement::Record(record) => {
                             let (key, value) = record.value;
                             results.lock().unwrap().insert(key, value);
                         }
-                        Ok(Some(StreamElement::End)) => {
-                            ended_count += 1;
-                        }
-                        Ok(Some(_)) | Ok(None) | Err(_) => {}
+                        StreamElement::End => break,
+                        _ => {}
                     }
                 }
+                Ok(())
+            }));
+        }
 
-                thread::sleep(std::time::Duration::from_micros(100));
+        // Join all collector threads in a wrapper thread so the caller
+        // still gets a single JoinHandle back.
+        thread::spawn(move || -> anyhow::Result<()> {
+            for handle in collector_handles {
+                handle.join().map_err(|_| anyhow::anyhow!("collector thread panicked"))??;
             }
-
             Ok(())
         })
     }
