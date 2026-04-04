@@ -24,3 +24,6 @@ tasks/
 streamcrab-final-v3_6.md
 streamcrab-final-v3_7.md
 streamcrab-flink-bridge/VERIFICATION.md
+
+# Benchmark result data
+benchmarks/results/
