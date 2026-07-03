@@ -3,16 +3,19 @@
 //!
 //! These are drop-in alternatives to the self-built `VectorOp(FilterOperator)`
 //! etc. — same `Operator<RecordBatch>` protocol, but expression evaluation and
-//! accumulation run on DataFusion machinery. The P11 SQL layer will compile
+//! accumulation run on DataFusion machinery. The P11 SQL layer compiles
 //! plans down to exactly these building blocks.
 
-use std::sync::Arc;
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Float64Type, Schema, SchemaRef};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::DFSchema;
@@ -113,21 +116,43 @@ impl Operator<RecordBatch> for DfProjectOp {
     }
 }
 
-/// Grouped SUM on DataFusion's `PrimitiveGroupsAccumulator` — the columnar
-/// fast path: group keys map to dense indices once per batch (arrow row
-/// format), then accumulation is a tight `values[group] += v` loop.
-///
-/// Emits `(key columns..., sum: Float64)` on event-time timers and resets,
-/// mirroring `HashAggregateOperator`'s emit-per-watermark semantics.
-pub struct DfGroupedSumOp {
-    key_cols: Vec<usize>,
-    value_col: usize,
+type SumAccumulator = PrimitiveGroupsAccumulator<Float64Type, fn(&mut f64, f64)>;
+
+fn new_sum_accumulator() -> SumAccumulator {
+    PrimitiveGroupsAccumulator::new(&DataType::Float64, (|acc, v| *acc += v) as fn(&mut f64, f64))
+}
+
+struct SumInner {
     converter: Option<RowConverter>,
     key_fields: Vec<Field>,
     group_index: AHashMap<Vec<u8>, usize>,
     group_rows: Vec<OwnedRow>,
-    acc: PrimitiveGroupsAccumulator<Float64Type, fn(&mut f64, f64)>,
+    acc: SumAccumulator,
     group_indices_buf: Vec<usize>,
+}
+
+impl SumInner {
+    fn group_count(&self) -> usize {
+        self.group_rows.len()
+    }
+}
+
+/// Grouped SUM on DataFusion's `PrimitiveGroupsAccumulator` — the columnar
+/// fast path: group keys map to dense indices once per batch (arrow row
+/// format), then accumulation is a tight `values[group] += v` loop.
+///
+/// Emits `(key columns..., <output_name>: Float64)` on event-time timers and
+/// resets, mirroring `HashAggregateOperator`'s emit-per-watermark semantics.
+///
+/// Checkpointable: `snapshot_state` drains the accumulator via
+/// `state(EmitTo::All)`, immediately merges it back (state extraction is
+/// destructive in DataFusion), and encodes keys + state as an arrow IPC
+/// stream.
+pub struct DfGroupedSumOp {
+    key_cols: Vec<usize>,
+    value_col: usize,
+    output_name: String,
+    inner: Mutex<SumInner>,
 }
 
 impl DfGroupedSumOp {
@@ -136,41 +161,90 @@ impl DfGroupedSumOp {
         Self {
             key_cols,
             value_col,
-            converter: None,
-            key_fields: Vec::new(),
-            group_index: AHashMap::default(),
-            group_rows: Vec::new(),
-            acc: new_sum_accumulator(),
-            group_indices_buf: Vec::new(),
+            output_name: "sum".to_string(),
+            inner: Mutex::new(SumInner {
+                converter: None,
+                key_fields: Vec::new(),
+                group_index: AHashMap::default(),
+                group_rows: Vec::new(),
+                acc: new_sum_accumulator(),
+                group_indices_buf: Vec::new(),
+            }),
         }
     }
-}
 
-fn new_sum_accumulator() -> PrimitiveGroupsAccumulator<Float64Type, fn(&mut f64, f64)> {
-    PrimitiveGroupsAccumulator::new(&DataType::Float64, (|acc, v| *acc += v) as fn(&mut f64, f64))
+    /// Name of the aggregate output column (the SQL planner aligns this with
+    /// the logical plan's field name, e.g. `sum(t.v)`).
+    pub fn with_output_name(mut self, name: impl Into<String>) -> Self {
+        self.output_name = name.into();
+        self
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SumInner>> {
+        self.inner
+            .lock()
+            .map_err(|_| anyhow!("DfGroupedSumOp state lock poisoned"))
+    }
+
+    /// Extract (keys + accumulator state) as one snapshot batch, restoring
+    /// the accumulator in place since `state()` drains it.
+    fn snapshot_batch(inner: &mut SumInner) -> Result<Option<RecordBatch>> {
+        let n = inner.group_count();
+        if n == 0 {
+            return Ok(None);
+        }
+        let converter = inner.converter.as_ref().context("groups imply converter")?;
+
+        let state = inner
+            .acc
+            .state(EmitTo::All)
+            .context("extract accumulator state")?;
+        let indices: Vec<usize> = (0..n).collect();
+        inner
+            .acc
+            .merge_batch(&state, &indices, None, n)
+            .context("restore accumulator after state extraction")?;
+
+        let mut columns = converter
+            .convert_rows(inner.group_rows.iter().map(|r| r.row()))
+            .context("rebuild key columns")?;
+        let mut fields = inner.key_fields.clone();
+        for (i, arr) in state.iter().enumerate() {
+            fields.push(Field::new(
+                format!("__state_{i}"),
+                arr.data_type().clone(),
+                true,
+            ));
+        }
+        columns.extend(state);
+        Ok(Some(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .context("build snapshot batch")?,
+        ))
+    }
 }
 
 impl Operator<RecordBatch> for DfGroupedSumOp {
     type OUT = RecordBatch;
 
-    fn process_batch(&mut self, input: &[RecordBatch], output: &mut Vec<RecordBatch>) -> Result<()> {
-        let _ = &mut *output;
+    fn process_batch(&mut self, input: &[RecordBatch], _output: &mut Vec<RecordBatch>) -> Result<()> {
+        let inner = &mut *self.lock()?;
         for batch in input {
-            if self.converter.is_none() {
+            if inner.converter.is_none() {
                 let fields: Vec<SortField> = self
                     .key_cols
                     .iter()
                     .map(|&i| SortField::new(batch.column(i).data_type().clone()))
                     .collect();
-                self.converter =
+                inner.converter =
                     Some(RowConverter::new(fields).context("build key row converter")?);
-                self.key_fields = self
+                inner.key_fields = self
                     .key_cols
                     .iter()
                     .map(|&i| batch.schema().field(i).clone())
                     .collect();
             }
-            let converter = self.converter.as_ref().expect("converter initialized above");
+            let converter = inner.converter.as_ref().expect("converter initialized above");
 
             let key_arrays: Vec<ArrayRef> = self
                 .key_cols
@@ -181,18 +255,19 @@ impl Operator<RecordBatch> for DfGroupedSumOp {
                 .convert_columns(&key_arrays)
                 .context("convert key columns")?;
 
-            self.group_indices_buf.clear();
+            let mut group_indices = std::mem::take(&mut inner.group_indices_buf);
+            group_indices.clear();
             for row in rows.iter() {
-                let idx = match self.group_index.get(row.as_ref()) {
+                let idx = match inner.group_index.get(row.as_ref()) {
                     Some(&i) => i,
                     None => {
-                        let i = self.group_index.len();
-                        self.group_index.insert(row.as_ref().to_vec(), i);
-                        self.group_rows.push(row.owned());
+                        let i = inner.group_index.len();
+                        inner.group_index.insert(row.as_ref().to_vec(), i);
+                        inner.group_rows.push(row.owned());
                         i
                     }
                 };
-                self.group_indices_buf.push(idx);
+                group_indices.push(idx);
             }
 
             let values = batch.column(self.value_col);
@@ -201,14 +276,12 @@ impl Operator<RecordBatch> for DfGroupedSumOp {
             } else {
                 cast(values, &DataType::Float64).context("cast sum input to f64")?
             };
-            self.acc
-                .update_batch(
-                    &[values_f64],
-                    &self.group_indices_buf,
-                    None,
-                    self.group_index.len(),
-                )
+            let total = inner.group_index.len();
+            inner
+                .acc
+                .update_batch(&[values_f64], &group_indices, None, total)
                 .context("GroupsAccumulator update_batch")?;
+            inner.group_indices_buf = group_indices;
         }
         Ok(())
     }
@@ -219,38 +292,103 @@ impl Operator<RecordBatch> for DfGroupedSumOp {
         domain: TimerDomain,
         output: &mut Vec<RecordBatch>,
     ) -> Result<()> {
-        if domain != TimerDomain::EventTime || self.group_rows.is_empty() {
+        if domain != TimerDomain::EventTime {
             return Ok(());
         }
-        let converter = self.converter.as_ref().expect("groups imply converter");
+        let inner = &mut *self.lock()?;
+        if inner.group_rows.is_empty() {
+            return Ok(());
+        }
+        let converter = inner.converter.as_ref().expect("groups imply converter");
 
-        let sums = self
+        let sums = inner
             .acc
             .evaluate(EmitTo::All)
             .context("GroupsAccumulator evaluate")?;
         let mut columns = converter
-            .convert_rows(self.group_rows.iter().map(|r| r.row()))
+            .convert_rows(inner.group_rows.iter().map(|r| r.row()))
             .context("rebuild key columns")?;
         columns.push(sums);
 
-        let mut fields = self.key_fields.clone();
-        fields.push(Field::new("sum", DataType::Float64, true));
+        let mut fields = inner.key_fields.clone();
+        fields.push(Field::new(&self.output_name, DataType::Float64, true));
         output.push(
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
                 .context("build aggregate output batch")?,
         );
 
-        self.group_index.clear();
-        self.group_rows.clear();
-        self.acc = new_sum_accumulator();
+        inner.group_index.clear();
+        inner.group_rows.clear();
+        inner.acc = new_sum_accumulator();
         Ok(())
     }
 
     fn snapshot_state(&self) -> Result<Vec<u8>> {
-        // GroupsAccumulator only exposes state destructively; wiring its
-        // state()/merge_batch into checkpoints lands with P11. Fail fast
-        // instead of silently dropping state on recovery.
-        bail!("DfGroupedSumOp does not support checkpointing yet; use VectorOp(HashAggregateOperator) for checkpointed pipelines")
+        let inner = &mut *self.lock()?;
+        let Some(batch) = Self::snapshot_batch(inner)? else {
+            return Ok(Vec::new());
+        };
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+                .context("open IPC snapshot writer")?;
+            writer.write(&batch).context("write snapshot batch")?;
+            writer.finish().context("finish snapshot stream")?;
+        }
+        Ok(buf)
+    }
+
+    fn restore_state(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut reader =
+            StreamReader::try_new(Cursor::new(data), None).context("open IPC snapshot reader")?;
+        let batch = reader
+            .next()
+            .context("snapshot stream is empty")?
+            .context("read snapshot batch")?;
+
+        let key_count = self.key_cols.len();
+        let schema = batch.schema();
+        let key_fields: Vec<Field> = schema.fields()[..key_count]
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let key_arrays: Vec<ArrayRef> = (0..key_count).map(|i| Arc::clone(batch.column(i))).collect();
+        let state: Vec<ArrayRef> = (key_count..batch.num_columns())
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+
+        let converter = RowConverter::new(
+            key_arrays
+                .iter()
+                .map(|a| SortField::new(a.data_type().clone()))
+                .collect(),
+        )
+        .context("rebuild key row converter")?;
+        let rows = converter
+            .convert_columns(&key_arrays)
+            .context("convert snapshot keys")?;
+
+        let inner = &mut *self.lock()?;
+        inner.group_index.clear();
+        inner.group_rows.clear();
+        inner.acc = new_sum_accumulator();
+        for row in rows.iter() {
+            let idx = inner.group_index.len();
+            inner.group_index.insert(row.as_ref().to_vec(), idx);
+            inner.group_rows.push(row.owned());
+        }
+        let n = inner.group_rows.len();
+        let indices: Vec<usize> = (0..n).collect();
+        inner
+            .acc
+            .merge_batch(&state, &indices, None, n)
+            .context("merge snapshot state")?;
+        inner.converter = Some(converter);
+        inner.key_fields = key_fields;
+        Ok(())
     }
 }
 
@@ -289,6 +427,27 @@ mod tests {
         );
     }
 
+    fn agg_results(batches: &[RecordBatch]) -> Vec<(i64, f64)> {
+        let mut rows = Vec::new();
+        for b in batches {
+            let keys = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            let sums = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((keys.value(i), sums.value(i)));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
     #[test]
     fn df_grouped_sum_emits_and_resets_on_watermark() {
         let rows: Vec<(i64, i64)> = (0..100).map(|i| (i % 4, i)).collect();
@@ -310,19 +469,10 @@ mod tests {
         for &(k, v) in &rows {
             *expected.entry(k).or_default() += v as f64;
         }
-        let keys = out[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let sums = out[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
-        assert_eq!(out[0].num_rows(), 4);
-        for i in 0..out[0].num_rows() {
-            assert_eq!(sums.value(i), expected[&keys.value(i)]);
+        let result = agg_results(&out);
+        assert_eq!(result.len(), 4);
+        for (k, s) in result {
+            assert_eq!(s, expected[&k]);
         }
 
         // Reset semantics: nothing left after the flush.
@@ -333,8 +483,63 @@ mod tests {
     }
 
     #[test]
-    fn df_grouped_sum_rejects_checkpoint() {
-        let op = DfGroupedSumOp::new(vec![0], 1);
-        assert!(op.snapshot_state().is_err());
+    fn df_grouped_sum_checkpoint_roundtrip() {
+        let part_a: Vec<(i64, i64)> = (0..50).map(|i| (i % 5, i)).collect();
+        let part_b: Vec<(i64, i64)> = (50..100).map(|i| (i % 5, i)).collect();
+
+        // Continuous reference.
+        let mut continuous = DfGroupedSumOp::new(vec![0], 1);
+        let mut all: Vec<(i64, i64)> = part_a.clone();
+        all.extend(&part_b);
+        let mut expected = Vec::new();
+        continuous
+            .process_batch(&[<(i64, i64)>::to_batch(&all).unwrap()], &mut expected)
+            .unwrap();
+        continuous
+            .on_timer(EVENT_TIME_MAX, TimerDomain::EventTime, &mut expected)
+            .unwrap();
+        let expected = agg_results(&expected);
+
+        // Snapshot mid-stream, restore into a fresh operator, finish there.
+        let mut first = DfGroupedSumOp::new(vec![0], 1);
+        let mut sink = Vec::new();
+        first
+            .process_batch(&[<(i64, i64)>::to_batch(&part_a).unwrap()], &mut sink)
+            .unwrap();
+        let snapshot = first.snapshot_state().unwrap();
+        assert!(!snapshot.is_empty());
+
+        // Snapshot must not disturb the running operator.
+        let mut first_out = Vec::new();
+        first
+            .process_batch(&[<(i64, i64)>::to_batch(&part_b).unwrap()], &mut first_out)
+            .unwrap();
+        first
+            .on_timer(EVENT_TIME_MAX, TimerDomain::EventTime, &mut first_out)
+            .unwrap();
+        assert_eq!(agg_results(&first_out), expected);
+
+        let mut second = DfGroupedSumOp::new(vec![0], 1);
+        second.restore_state(&snapshot).unwrap();
+        let mut resumed = Vec::new();
+        second
+            .process_batch(&[<(i64, i64)>::to_batch(&part_b).unwrap()], &mut resumed)
+            .unwrap();
+        second
+            .on_timer(EVENT_TIME_MAX, TimerDomain::EventTime, &mut resumed)
+            .unwrap();
+        assert_eq!(agg_results(&resumed), expected);
+    }
+
+    #[test]
+    fn df_grouped_sum_custom_output_name() {
+        let rows = vec![(1i64, 2i64), (1, 3)];
+        let mut op = DfGroupedSumOp::new(vec![0], 1).with_output_name("sum(t.v)");
+        let mut out = Vec::new();
+        op.process_batch(&[<(i64, i64)>::to_batch(&rows).unwrap()], &mut out)
+            .unwrap();
+        op.on_timer(EVENT_TIME_MAX, TimerDomain::EventTime, &mut out)
+            .unwrap();
+        assert_eq!(out[0].schema().field(1).name(), "sum(t.v)");
     }
 }
