@@ -61,7 +61,7 @@ fn bench_map_1m_p1() {
         .from_iter(data)
         .map(|x: &i64| (*x, *x * 2))
         .key_by(|pair: &(i64, i64)| pair.0 % 10)
-        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1 + b.1))
+        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1.wrapping_add(b.1)))
         .execute_with_parallelism(1)
         .unwrap();
     let elapsed = start.elapsed();
@@ -85,7 +85,7 @@ fn bench_filter_map_1m_p1() {
         .filter(|x: &i64| x % 2 == 0)
         .map(|x: &i64| (*x, *x * *x))
         .key_by(|pair: &(i64, i64)| pair.0 % 10)
-        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1 + b.1))
+        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1.wrapping_add(b.1)))
         .execute_with_parallelism(1)
         .unwrap();
     let elapsed = start.elapsed();
@@ -109,7 +109,7 @@ fn bench_filter_map_10m_p1() {
         .filter(|x: &i64| x % 2 == 0)
         .map(|x: &i64| (*x, *x * *x))
         .key_by(|pair: &(i64, i64)| pair.0 % 10)
-        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1 + b.1))
+        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1.wrapping_add(b.1)))
         .execute_with_parallelism(1)
         .unwrap();
     let elapsed = start.elapsed();
@@ -133,7 +133,7 @@ fn bench_filter_map_10m_p4() {
         .filter(|x: &i64| x % 2 == 0)
         .map(|x: &i64| (*x, *x * *x))
         .key_by(|pair: &(i64, i64)| pair.0 % 10)
-        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1 + b.1))
+        .reduce(|a: (i64, i64), b: (i64, i64)| (a.0, a.1.wrapping_add(b.1)))
         .execute_with_parallelism(4)
         .unwrap();
     let elapsed = start.elapsed();
