@@ -4,6 +4,7 @@
 //! designed to bridge to Apache Flink via JNI.
 
 pub mod batch;
+pub mod convert;
 pub mod expression;
 pub mod hash_table;
 pub mod memory;
@@ -11,3 +12,4 @@ pub mod operators;
 pub mod spill;
 
 pub use batch::VeloxBatch;
+pub use convert::ArrowConvertible;
