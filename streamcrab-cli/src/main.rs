@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use streamcrab_core::checkpoint::CheckpointStorageConfig;
 use streamcrab_core::cluster::rpc::job_manager_service_client::JobManagerServiceClient;
 use streamcrab_core::cluster::{
     ClusterConfig, HeartbeatConfig, JobManager, Resources, TaskManager, rpc,
@@ -27,6 +28,23 @@ enum Commands {
         heartbeat_interval_ms: u64,
         #[arg(long, default_value_t = 30000)]
         heartbeat_timeout_ms: u64,
+        /// Checkpoint storage backend: memory | fs | s3
+        #[arg(long, default_value = "memory")]
+        checkpoint_storage: String,
+        /// Base directory (required for --checkpoint-storage fs)
+        #[arg(long)]
+        checkpoint_path: Option<std::path::PathBuf>,
+        /// Bucket (required for --checkpoint-storage s3); credentials via
+        /// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars
+        #[arg(long)]
+        s3_bucket: Option<String>,
+        #[arg(long, default_value = "checkpoints")]
+        s3_root: String,
+        /// Custom S3 endpoint, e.g. http://127.0.0.1:9000 for MinIO
+        #[arg(long)]
+        s3_endpoint: Option<String>,
+        #[arg(long)]
+        s3_region: Option<String>,
     },
     Taskmanager {
         #[arg(long)]
@@ -92,7 +110,30 @@ async fn main() -> anyhow::Result<()> {
             listen,
             heartbeat_interval_ms,
             heartbeat_timeout_ms,
+            checkpoint_storage,
+            checkpoint_path,
+            s3_bucket,
+            s3_root,
+            s3_endpoint,
+            s3_region,
         } => {
+            let storage_config = match checkpoint_storage.as_str() {
+                "memory" => CheckpointStorageConfig::InMemory,
+                "fs" => CheckpointStorageConfig::Fs {
+                    path: checkpoint_path.ok_or_else(|| {
+                        anyhow::anyhow!("--checkpoint-path is required for fs storage")
+                    })?,
+                },
+                "s3" => CheckpointStorageConfig::S3 {
+                    bucket: s3_bucket.ok_or_else(|| {
+                        anyhow::anyhow!("--s3-bucket is required for s3 storage")
+                    })?,
+                    root: s3_root,
+                    endpoint: s3_endpoint,
+                    region: s3_region,
+                },
+                other => anyhow::bail!("unknown checkpoint storage backend: {other}"),
+            };
             let config = ClusterConfig {
                 heartbeat: HeartbeatConfig {
                     interval: Duration::from_millis(heartbeat_interval_ms),
@@ -101,8 +142,11 @@ async fn main() -> anyhow::Result<()> {
                 state_service_endpoint: None,
                 ..ClusterConfig::default()
             };
-            let jm = Arc::new(JobManager::new(config));
-            println!("jobmanager listening on {listen}");
+            let jm = Arc::new(JobManager::with_checkpoint_storage(
+                config,
+                storage_config.build()?,
+            ));
+            println!("jobmanager listening on {listen} (checkpoint storage: {checkpoint_storage})");
             jm.serve(listen).await?;
         }
         Commands::Taskmanager {

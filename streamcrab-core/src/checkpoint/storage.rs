@@ -15,6 +15,44 @@ pub trait CheckpointStorage: Send + Sync {
     fn purge(&self, keep_last_n: usize) -> Result<()>;
 }
 
+/// Declarative choice of checkpoint storage backend, built at cluster startup.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CheckpointStorageConfig {
+    #[default]
+    InMemory,
+    Fs {
+        path: PathBuf,
+    },
+    /// S3-compatible object store (AWS S3, MinIO, OSS). Credentials come from
+    /// the standard AWS env vars / credential chain.
+    S3 {
+        bucket: String,
+        root: String,
+        endpoint: Option<String>,
+        region: Option<String>,
+    },
+}
+
+impl CheckpointStorageConfig {
+    pub fn build(&self) -> Result<Arc<dyn CheckpointStorage>> {
+        Ok(match self {
+            Self::InMemory => Arc::new(InMemoryCheckpointStorage::new()),
+            Self::Fs { path } => Arc::new(FsCheckpointStorage::new(path.clone())?),
+            Self::S3 {
+                bucket,
+                root,
+                endpoint,
+                region,
+            } => Arc::new(ObjectStoreCheckpointStorage::s3(
+                bucket,
+                root,
+                endpoint.as_deref(),
+                region.as_deref(),
+            )?),
+        })
+    }
+}
+
 /// In-memory checkpoint storage for tests and local single-process execution.
 #[derive(Default)]
 pub struct InMemoryCheckpointStorage {

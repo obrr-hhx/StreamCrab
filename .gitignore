@@ -27,3 +27,6 @@ streamcrab-flink-bridge/VERIFICATION.md
 
 # Benchmark result data
 benchmarks/results/
+
+# Maven shade plugin artifact
+streamcrab-flink-java/dependency-reduced-pom.xml

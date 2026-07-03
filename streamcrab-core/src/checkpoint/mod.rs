@@ -15,12 +15,14 @@ mod aligner;
 mod coordinator;
 mod events;
 mod metadata;
+mod opendal_storage;
 mod storage;
 
 pub use aligner::*;
 pub use coordinator::*;
 pub use events::*;
 pub use metadata::*;
+pub use opendal_storage::*;
 pub use storage::*;
 
 #[cfg(test)]

@@ -8,7 +8,8 @@ use anyhow::{Result, anyhow};
 use tonic::{Request, Response, Status};
 
 use crate::checkpoint::{
-    CheckpointCoordinator, InMemoryCheckpointStorage, TaskCheckpointAbort, TaskCheckpointAck,
+    CheckpointCoordinator, CheckpointStorage, InMemoryCheckpointStorage, TaskCheckpointAbort,
+    TaskCheckpointAck,
 };
 use crate::cluster::rpc::job_manager_service_server::{JobManagerService, JobManagerServiceServer};
 use crate::cluster::rpc::task_manager_service_client::TaskManagerServiceClient;
@@ -45,7 +46,7 @@ pub struct JobManager {
     task_to_job: RwLock<HashMap<String, JobId>>,
     checkpoint_to_job: Mutex<HashMap<u64, JobId>>,
     scheduler: Mutex<RoundRobinScheduler>,
-    checkpoint_coordinator: Arc<CheckpointCoordinator<InMemoryCheckpointStorage>>,
+    checkpoint_coordinator: Arc<CheckpointCoordinator<dyn CheckpointStorage>>,
     state_service_client: Option<GrpcStateClient>,
     rescale_coordinator: Mutex<super::RescaleCoordinator>,
     autoscaler: Mutex<Autoscaler>,
@@ -54,9 +55,17 @@ pub struct JobManager {
 
 impl JobManager {
     pub fn new(config: ClusterConfig) -> Self {
-        let storage = Arc::new(InMemoryCheckpointStorage::new());
+        Self::with_checkpoint_storage(config, Arc::new(InMemoryCheckpointStorage::new()))
+    }
+
+    /// Create a JobManager with an explicit checkpoint storage backend,
+    /// e.g. S3-backed for durable cluster deployments.
+    pub fn with_checkpoint_storage(
+        config: ClusterConfig,
+        checkpoint_storage: Arc<dyn CheckpointStorage>,
+    ) -> Self {
         let checkpoint_coordinator =
-            Arc::new(CheckpointCoordinator::new(storage).with_retained_checkpoints(3));
+            Arc::new(CheckpointCoordinator::new(checkpoint_storage).with_retained_checkpoints(3));
         let autoscaler_cooldown = config.autoscaler_cooldown;
         let state_service_client = config
             .state_service_endpoint

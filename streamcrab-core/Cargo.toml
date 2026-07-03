@@ -18,6 +18,7 @@ tokio = { workspace = true }
 arc-swap = "1"
 futures = "0.3"
 rdkafka = { version = "0.36", features = ["dynamic-linking"] }
+opendal = { version = "0.57.0", features = ["services-memory", "services-s3"] }
 
 [build-dependencies]
 tonic-build = "0.12"

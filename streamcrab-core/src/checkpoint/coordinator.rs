@@ -11,7 +11,7 @@ pub struct PendingCheckpoint {
 }
 
 /// Checkpoint coordinator skeleton for single-process mode.
-pub struct CheckpointCoordinator<S: CheckpointStorage> {
+pub struct CheckpointCoordinator<S: CheckpointStorage + ?Sized> {
     pub next_checkpoint_id: AtomicU64,
     pub pending_checkpoints: Mutex<HashMap<CheckpointId, PendingCheckpoint>>,
     pub completed_checkpoints: Mutex<VecDeque<CheckpointMetadata>>,
@@ -20,7 +20,7 @@ pub struct CheckpointCoordinator<S: CheckpointStorage> {
     pub retained_checkpoints: usize,
 }
 
-impl<S: CheckpointStorage> CheckpointCoordinator<S> {
+impl<S: CheckpointStorage + ?Sized> CheckpointCoordinator<S> {
     pub fn new(checkpoint_storage: Arc<S>) -> Self {
         Self {
             next_checkpoint_id: AtomicU64::new(1),
