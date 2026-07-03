@@ -4,6 +4,7 @@
 //! designed to bridge to Apache Flink via JNI.
 
 pub mod batch;
+pub mod bridge;
 pub mod convert;
 pub mod expression;
 pub mod hash_table;

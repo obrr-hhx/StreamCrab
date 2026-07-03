@@ -5,7 +5,9 @@ use streamcrab_core::checkpoint::{
     CheckpointCoordinator, InMemoryCheckpointStorage, TaskCheckpointAck, TaskCheckpointEvent,
 };
 use streamcrab_core::elastic::ElasticConfig;
-use streamcrab_core::operator_chain::{Append, ChainEnd, FilterOp, FlatMapOp, MapOp, Operator};
+use streamcrab_core::operator_chain::{
+    Append, ChainEnd, FilterOp, FlatMapOp, MapOp, Operator, TimerDomain,
+};
 use streamcrab_core::state::{
     InMemoryStateClient, StateMode, StateServiceCore, StateServiceCoreConfig, TieredStateBackend,
     TieredStateBackendConfig,
@@ -158,6 +160,28 @@ impl<Strategy> TimestampAssignerOperator<Strategy> {
 /// A stream that has an event-time [`WatermarkStrategy`] assigned.
 ///
 /// Created by calling [`DataStream::assign_timestamps_and_watermarks`].
+impl<T, OpChain> DataStream<T, OpChain>
+where
+    T: StreamData + Send + 'static,
+{
+    /// Append an arbitrary core [`Operator`] to the chain.
+    ///
+    /// Unlike [`map`](Self::map)/[`filter`](Self::filter), this impl block has
+    /// no `StreamData` bound on the chain's output, so operators whose
+    /// element type is an Arrow `RecordBatch` (the vectorized bridge:
+    /// Batcher → VectorOp(...) → Unbatcher) can run mid-chain. Return to a
+    /// `StreamData` row type before `key_by`/window/execute stages.
+    pub fn transform<Op>(self, op: Op) -> DataStream<T, <OpChain as Append<Op>>::Result>
+    where
+        OpChain: Append<Op>,
+    {
+        DataStream {
+            source_data: self.source_data,
+            op_chain: self.op_chain.append(op),
+        }
+    }
+}
+
 pub struct WatermarkedStream<T, OpChain, Strategy>
 where
     T: StreamData + Send + 'static,
@@ -424,6 +448,11 @@ where
         let mut transformed: Vec<OpChain::OUT> = Vec::new();
         self.op_chain
             .process_batch(&self.source_data, &mut transformed)?;
+        self.op_chain.on_timer(
+            streamcrab_core::time::EVENT_TIME_MAX,
+            TimerDomain::EventTime,
+            &mut transformed,
+        )?;
 
         // Step 2: TimestampAssigner operator + watermark generator.
         let timestamp_assigner = TimestampAssignerOperator::new(self.strategy);
@@ -534,6 +563,13 @@ where
         let mut transformed_data: Vec<OpChain::OUT> = Vec::new();
         self.op_chain
             .process_batch(&self.source_data, &mut transformed_data)?;
+        // Drain operators that buffer across calls (e.g. vectorized Batcher):
+        // the bounded input is fully consumed, so fire the final timer.
+        self.op_chain.on_timer(
+            streamcrab_core::time::EVENT_TIME_MAX,
+            TimerDomain::EventTime,
+            &mut transformed_data,
+        )?;
 
         // Create channels: Source -> Window Tasks.
         let mut source_to_window_channels = Vec::new();
@@ -717,6 +753,13 @@ where
         let mut transformed_data: Vec<OpChain::OUT> = Vec::new();
         self.op_chain
             .process_batch(&self.source_data, &mut transformed_data)?;
+        // Drain operators that buffer across calls (e.g. vectorized Batcher):
+        // the bounded input is fully consumed, so fire the final timer.
+        self.op_chain.on_timer(
+            streamcrab_core::time::EVENT_TIME_MAX,
+            TimerDomain::EventTime,
+            &mut transformed_data,
+        )?;
 
         let mut barrier_points = barrier_after_records.to_vec();
         barrier_points.sort_unstable();
@@ -1205,6 +1248,13 @@ where
         let mut transformed_data = Vec::new();
         self.op_chain
             .process_batch(&self.source_data, &mut transformed_data)?;
+        // Drain operators that buffer across calls (e.g. vectorized Batcher):
+        // the bounded input is fully consumed, so fire the final timer.
+        self.op_chain.on_timer(
+            streamcrab_core::time::EVENT_TIME_MAX,
+            TimerDomain::EventTime,
+            &mut transformed_data,
+        )?;
 
         let (source_senders, source_receivers) =
             Self::create_channels::<OpChain::OUT>(parallelism, buffer_size);
@@ -1279,6 +1329,13 @@ where
         let mut transformed_data = Vec::new();
         self.op_chain
             .process_batch(&self.source_data, &mut transformed_data)?;
+        // Drain operators that buffer across calls (e.g. vectorized Batcher):
+        // the bounded input is fully consumed, so fire the final timer.
+        self.op_chain.on_timer(
+            streamcrab_core::time::EVENT_TIME_MAX,
+            TimerDomain::EventTime,
+            &mut transformed_data,
+        )?;
 
         let mut barrier_points = barrier_after_records.to_vec();
         barrier_points.sort_unstable();
@@ -1876,6 +1933,11 @@ where
         let mut chain_output: Vec<OpChain::OUT> = Vec::new();
         self.op_chain
             .process_batch(&self.source_data, &mut chain_output)?;
+        self.op_chain.on_timer(
+            streamcrab_core::time::EVENT_TIME_MAX,
+            TimerDomain::EventTime,
+            &mut chain_output,
+        )?;
 
         // Step 2: serialize each record to bytes for the WASM ABI.
         let serialized: Vec<Vec<u8>> = chain_output

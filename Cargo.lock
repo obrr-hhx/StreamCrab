@@ -3732,6 +3732,7 @@ dependencies = [
  "arrow-schema",
  "bincode",
  "serde",
+ "streamcrab-api",
  "streamcrab-core",
  "thiserror 2.0.18",
 ]

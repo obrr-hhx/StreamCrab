@@ -30,3 +30,5 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # For test assertions
 arrow-cast = "54"
+# End-to-end tests driving the bridge through the DataStream API
+streamcrab-api = { workspace = true }
