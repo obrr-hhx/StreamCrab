@@ -2,9 +2,13 @@
 
 A Rust-based stream processing engine implementing Apache Flink semantics with three core promises:
 
-1. **Minimal** -- ~27K LOC Rust + ~400 LOC Java, 1/100th of Flink
+1. **Minimal** -- ~28K LOC Rust + ~400 LOC Java, 1/100th of Flink
 2. **High Performance** -- Zero GC pauses, 50-100x Flink on stateless operators, 2-6x on stateful
 3. **Operator-Level Elasticity** -- Single operator rescale <5s, zero state migration
+
+Plus a lakehouse-native data plane: Apache Paimon source & exactly-once 2PC
+sink, DataFusion-powered vectorized operators, and a SQL layer that compiles
+queries onto them.
 
 StreamCrab is an educational-grade implementation prioritizing code readability and architectural clarity over production features.
 
@@ -20,6 +24,10 @@ STATE PLANE       State Service (Epoch-based Commit, Checkpoint to FS/S3)
 VECTORIZED        Flink JVM ──JNI (Arrow zero-copy)── Rust cdylib
                   streamcrab-flink-bridge → streamcrab-vectorized
                   (Filter, Project, HashAgg, HashJoin, WindowAgg)
+
+SQL & LAKEHOUSE   SQL ──datafusion-sql──> LogicalPlan ──> Df operators
+                  Paimon table ──scan──> RecordBatch ──> vectorized pipeline
+                  pipeline ──2PC PaimonSink──> Paimon snapshot commit
 ```
 
 **Key design decisions:**
@@ -45,6 +53,8 @@ VECTORIZED        Flink JVM ──JNI (Arrow zero-copy)── Rust cdylib
 | `streamcrab-flink-java` | Flink 1.20 Operator wrapper (Maven) | ~400 |
 | `streamcrab-wasm` | WASM Host runtime (wasmtime) + WasmOperator | ~600 |
 | `streamcrab-wasm-guest` | Guest SDK for WASM UDFs | ~200 |
+| `streamcrab-paimon` | Apache Paimon source + exactly-once 2PC sink | ~400 |
+| `streamcrab-sql` | SQL layer: DataFusion planner → vectorized pipelines | ~300 |
 
 ## Quick Start
 
@@ -72,6 +82,43 @@ let results = results.lock().unwrap();
 assert_eq!(results["hello"].1, 3);
 assert_eq!(results["world"].1, 3);
 assert_eq!(results["streamcrab"].1, 1);
+```
+
+### SQL over a Paimon Table
+
+```rust
+use streamcrab_paimon::{PaimonSink, PaimonSource};
+use streamcrab_sql::SqlContext;
+
+// Exactly-once write: prepare per epoch, commit after checkpoint seal.
+let mut sink = PaimonSink::new("/warehouse", "db", "t");
+sink.open()?;
+sink.write_batch(&batch)?;         // Arrow RecordBatch
+sink.pre_commit(epoch)?;           // phase 1: paimon prepare_commit
+sink.commit_transaction(epoch)?;   // phase 2: paimon snapshot commit
+
+// Arrow-native scan straight into the SQL layer — no row conversion.
+let batches = PaimonSource::new("/warehouse", "db", "t").scan_blocking()?;
+let mut ctx = SqlContext::new();
+ctx.register_batches("t", batches)?;
+let result = ctx.sql("SELECT k, SUM(v) AS total FROM t WHERE v > 50 GROUP BY k")?;
+```
+
+### Vectorized Operators in a DataStream Pipeline
+
+```rust
+use streamcrab_vectorized::bridge::{Batcher, Unbatcher, VectorOp};
+
+// RecordBatch flows as a plain element type: barriers, watermarks and the
+// rescale protocol are untouched.
+let results = env
+    .from_iter(rows)
+    .transform(Batcher::<(i64, i64)>::new(256))
+    .transform(VectorOp::new(FilterOperator::new(gt(col(1), lit_i64(500)))))
+    .transform(Unbatcher::<(i64, i64)>::new())
+    .key_by(|r: &(i64, i64)| r.0)
+    .reduce(|a, b| (a.0, a.1 + b.1))
+    .execute_with_parallelism(2)?;
 ```
 
 ### WASM UDF Example
@@ -107,18 +154,29 @@ export_process_fn!(Counter);
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release with SIMD (target-cpu=native)
-cargo test --workspace         # Run all 471 tests
+cargo test --workspace         # Run all 500+ tests
 cargo clippy --workspace       # Lint (should be clean)
 
 # WASM guest compilation
 cd examples/wasm-counter
 cargo build --target wasm32-unknown-unknown --release
 
-# Vectorized engine benchmarks
+# Vectorized engine benchmarks (standalone + in-runtime bridge)
 cargo test -p streamcrab-vectorized --test benchmark_tests --release -- --nocapture
+cargo test -p streamcrab-vectorized --test bridge_benchmark --release -- --nocapture
+
+# Paimon roundtrip + 2PC sink tests (self-contained, local warehouse)
+cargo test -p streamcrab-paimon
+
+# SQL layer tests (includes SQL over a real Paimon table)
+cargo test -p streamcrab-sql
 
 # Kafka integration tests (requires Docker Kafka on localhost:9092)
 cargo test -p streamcrab-core --test kafka_e2e -- --ignored
+
+# S3 checkpoint E2E (requires MinIO; see tests/s3_checkpoint_e2e.rs docs)
+AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+  cargo test -p streamcrab-core --test s3_checkpoint_e2e -- --ignored
 ```
 
 ## Performance
@@ -133,6 +191,16 @@ WindowAggregate:       3.3 M rows/sec
 Arrow FFI roundtrip:   ~0ms per 1M rows (zero-copy)
 JNI Filter E2E:      187.1 M rows/sec
 ```
+
+### In-Runtime Bridge (Release build, 10M rows, Apple M2)
+```
+filter+project   row chain (LLVM-inlined)   115.8 M rows/sec
+                 DataFusion operators       133.8 M rows/sec  (1.16x)
+keyed sum        DataFusion GroupsAccumulator 42.3 M rows/sec
+```
+DataFusion physical expressions beat the fully inlined row chain in-process;
+the gap widens further at parallelism > 1 where batching amortizes channel
+sends by the batch size.
 
 ### vs Flink
 - Stateless operators: **50-100x** faster
@@ -168,6 +236,9 @@ JNI Filter E2E:      187.1 M rows/sec
 
 ### Connectors & Monitoring
 - Kafka Source + 2PC Sink (rdkafka)
+- Apache Paimon Source (bounded snapshot scan, Arrow-native)
+- Apache Paimon 2PC Sink (prepare_commit per epoch, snapshot commit after seal)
+- S3/object-store checkpoint storage (OpenDAL: S3/OSS/GCS/MinIO), CLI-configurable
 - AsyncExternalCall operator (At-Least-Once, retry policy)
 - TaskMetrics: throughput, latency, queue usage, checkpoint duration
 - Nexmark benchmark: events, generator, queries Q1/Q2/Q5/Q8
@@ -176,6 +247,17 @@ JNI Filter E2E:      187.1 M rows/sec
 - Velox-inspired Arrow-based engine
 - Filter, Project, HashAggregate, HashJoin, WindowAggregate
 - Flink JNI bridge via Arrow C Data Interface (zero-copy)
+- In-runtime bridge: `RecordBatch` as a plain element type — Batcher/Unbatcher
+  boundary operators, `DataStream::transform()`, batch-level keyed repartition
+- DataFusion operators (physical expressions + GroupsAccumulator fast path)
+  with checkpoint support
+
+### SQL (v1 subset)
+- `SELECT` / `WHERE` / expression projections / `GROUP BY` + `SUM` over
+  registered tables (in-memory batches or Paimon scans)
+- datafusion-sql parser & planner; logical plans compile to the DataFusion
+  operator pipeline; unsupported constructs fail explicitly, never silently
+- Full lakehouse loop tested: 2PC sink write → Paimon scan → SQL aggregation
 
 ## Flink Semantics Preserved
 
