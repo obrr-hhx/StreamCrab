@@ -1,0 +1,19 @@
+[package]
+name = "streamcrab-paimon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Apache Paimon source connector for StreamCrab"
+
+[dependencies]
+paimon = "0.2"
+arrow = "58"
+futures = "0.3"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+streamcrab-core = { workspace = true }
+
+[dev-dependencies]
+streamcrab-vectorized = { path = "../streamcrab-vectorized" }

@@ -6,6 +6,7 @@ members = [
     "streamcrab-examples",
     "streamcrab-vectorized",
     "streamcrab-flink-bridge",
+    "streamcrab-paimon",
     "streamcrab-wasm",
 ]
 resolver = "2"
