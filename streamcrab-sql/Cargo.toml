@@ -1,0 +1,22 @@
+[package]
+name = "streamcrab-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQL layer for StreamCrab: DataFusion planner compiled to vectorized operator pipelines"
+
+[dependencies]
+arrow = "58"
+datafusion-common = "53"
+datafusion-expr = "53"
+datafusion-sql = "53"
+datafusion-functions-aggregate = "53"
+anyhow = { workspace = true }
+
+streamcrab-core = { workspace = true }
+streamcrab-vectorized = { path = "../streamcrab-vectorized" }
+
+[dev-dependencies]
+streamcrab-paimon = { path = "../streamcrab-paimon" }
+paimon = "0.2"
+tokio = { workspace = true }
