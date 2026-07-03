@@ -11,9 +11,9 @@ crate-type = ["cdylib"]
 [dependencies]
 streamcrab-vectorized = { path = "../streamcrab-vectorized" }
 jni = "0.21"
-arrow = { version = "54", features = ["ffi"] }
-arrow-array = "54"
-arrow-schema = "54"
+arrow = { version = "58", features = ["ffi"] }
+arrow-array = "58"
+arrow-schema = "58"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"

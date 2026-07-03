@@ -13,9 +13,11 @@
 //! operators delegate snapshot/restore to their own state.
 
 mod batcher;
+mod datafusion_op;
 mod repartition;
 mod vector_op;
 
 pub use batcher::{Batcher, Unbatcher};
+pub use datafusion_op::{DfFilterOp, DfGroupedSumOp, DfProjectOp};
 pub use repartition::{BatchRepartition, SubBatchPartitioner};
 pub use vector_op::VectorOp;

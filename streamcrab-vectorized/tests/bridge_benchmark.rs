@@ -10,7 +10,8 @@ use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 use streamcrab_core::operator_chain::{Chain, ChainEnd, Operator, TimerDomain};
 use streamcrab_core::time::EVENT_TIME_MAX;
-use streamcrab_vectorized::bridge::{Batcher, Unbatcher, VectorOp};
+use streamcrab_vectorized::bridge::{Batcher, DfFilterOp, DfGroupedSumOp, DfProjectOp, Unbatcher, VectorOp};
+use streamcrab_vectorized::convert::ArrowConvertible;
 use streamcrab_vectorized::expression::{col, gt, lit_i64, mul};
 use streamcrab_vectorized::operators::{
     AggregateDescriptor, AggregateFunction, FilterOperator, HashAggregateOperator,
@@ -98,12 +99,43 @@ fn bench_row_vs_vectorized_filter_project() {
         .unwrap();
     let vec_time = start.elapsed();
 
+    // DataFusion physical-expr pipeline over the same shape.
+    let schema = <(i64, i64)>::schema();
+    let mut df_chain = Chain::new(
+        Batcher::<(i64, i64)>::new(1024),
+        Chain::new(
+            DfFilterOp::try_new(datafusion_expr::col("f1").gt(datafusion_expr::lit(n / 2)), &schema)
+                .unwrap(),
+            Chain::new(
+                DfProjectOp::try_new(
+                    vec![
+                        (datafusion_expr::col("f0"), "f0"),
+                        (datafusion_expr::col("f1") * datafusion_expr::lit(2i64), "f1"),
+                    ],
+                    &schema,
+                )
+                .unwrap(),
+                Chain::new(Unbatcher::<(i64, i64)>::new(), ChainEnd),
+            ),
+        ),
+    );
+    let start = Instant::now();
+    let mut df_out = Vec::new();
+    df_chain.process_batch(&rows, &mut df_out).unwrap();
+    df_chain
+        .on_timer(EVENT_TIME_MAX, TimerDomain::EventTime, &mut df_out)
+        .unwrap();
+    let df_time = start.elapsed();
+
     row_out.sort_unstable();
     vec_out.sort_unstable();
+    df_out.sort_unstable();
     assert_eq!(row_out, vec_out);
+    assert_eq!(row_out, df_out);
 
     let row_tp = n as f64 / row_time.as_secs_f64() / 1e6;
     let vec_tp = n as f64 / vec_time.as_secs_f64() / 1e6;
+    let df_tp = n as f64 / df_time.as_secs_f64() / 1e6;
     println!("\n=== P9 bench: filter+project over {n} rows ===");
     println!(
         "  row-oriented : {:>8.1} ms  ({row_tp:.1} M rec/s)",
@@ -114,8 +146,12 @@ fn bench_row_vs_vectorized_filter_project() {
         vec_time.as_secs_f64() * 1e3
     );
     println!(
-        "  speedup      : {:.2}x",
-        row_time.as_secs_f64() / vec_time.as_secs_f64()
+        "  datafusion   : {:>8.1} ms  ({df_tp:.1} M rec/s)",
+        df_time.as_secs_f64() * 1e3
+    );
+    println!(
+        "  df vs row    : {:.2}x",
+        row_time.as_secs_f64() / df_time.as_secs_f64()
     );
 }
 
@@ -153,31 +189,53 @@ fn bench_row_vs_vectorized_keyed_sum() {
         .unwrap();
     let vec_time = start.elapsed();
 
+    // DataFusion GroupsAccumulator pipeline.
+    let mut df_chain = Chain::new(
+        Batcher::<(i64, i64)>::new(1024),
+        Chain::new(DfGroupedSumOp::new(vec![0], 1), ChainEnd),
+    );
+    let start = Instant::now();
+    let mut df_out = Vec::new();
+    df_chain.process_batch(&rows, &mut df_out).unwrap();
+    df_chain
+        .on_timer(EVENT_TIME_MAX, TimerDomain::EventTime, &mut df_out)
+        .unwrap();
+    let df_time = start.elapsed();
+
     // Correctness: every group's sum must match the row-oriented reference.
-    let mut groups = 0usize;
-    for b in &out {
-        let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let sums = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        for i in 0..b.num_rows() {
-            assert_eq!(sums.value(i), map[&keys.value(i)]);
-            groups += 1;
+    let check = |batches: &[arrow::record_batch::RecordBatch]| {
+        let mut groups = 0usize;
+        for b in batches {
+            let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let sums = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                assert_eq!(sums.value(i), map[&keys.value(i)]);
+                groups += 1;
+            }
         }
-    }
-    assert_eq!(groups, 1024);
+        assert_eq!(groups, 1024);
+    };
+    check(&out);
+    check(&df_out);
 
     let row_tp = n as f64 / row_time.as_secs_f64() / 1e6;
     let vec_tp = n as f64 / vec_time.as_secs_f64() / 1e6;
+    let df_tp = n as f64 / df_time.as_secs_f64() / 1e6;
     println!("\n=== P9 bench: keyed sum over {n} rows (1024 keys) ===");
     println!(
         "  row hashmap  : {:>8.1} ms  ({row_tp:.1} M rec/s)",
         row_time.as_secs_f64() * 1e3
     );
     println!(
-        "  vectorized   : {:>8.1} ms  ({vec_tp:.1} M rec/s)",
+        "  own hashagg  : {:>8.1} ms  ({vec_tp:.1} M rec/s)",
         vec_time.as_secs_f64() * 1e3
     );
     println!(
-        "  speedup      : {:.2}x",
-        row_time.as_secs_f64() / vec_time.as_secs_f64()
+        "  datafusion   : {:>8.1} ms  ({df_tp:.1} M rec/s)",
+        df_time.as_secs_f64() * 1e3
+    );
+    println!(
+        "  df vs row    : {:.2}x",
+        row_time.as_secs_f64() / df_time.as_secs_f64()
     );
 }
